@@ -74,10 +74,6 @@ usagebar --render --sizes 80x24,140x45    # draw frames to stdout, ANSI and all
 
 ## Notes
 
-The sparkline under each percentage is this tool's own readings over time, drawn on an
-absolute 0-100 scale. It is the only value not sent by a vendor, and it is labelled by
-construction: a flat line at 90% looks nothing like one at 5%.
-
 When a poll fails, the panel keeps the last good reading and marks it `stale` with its age
 instead of blanking out. Panels only read `unavailable` when there is no previous number to
 stand on.

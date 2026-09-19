@@ -1,6 +1,6 @@
 //! Rendering. A dense panel grid with vendor-accurate numbers, tuned for a dark terminal.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -14,9 +14,6 @@ use crate::model::{Health, Report};
 
 pub struct App {
     pub reports: Vec<Report>,
-    /// Observed samples per (provider, window). These are our own readings of vendor
-    /// numbers, so the sparkline never invents history.
-    pub history: HashMap<(String, String), VecDeque<f64>>,
     pub last_refresh: Option<Instant>,
     pub refreshing: bool,
     pub paused: bool,
@@ -27,7 +24,6 @@ impl App {
     pub fn new(interval_secs: u64) -> Self {
         Self {
             reports: Vec::new(),
-            history: HashMap::new(),
             last_refresh: None,
             refreshing: false,
             paused: false,
@@ -71,28 +67,9 @@ impl App {
             })
             .collect();
 
-        for report in &reports {
-            for window in &report.windows {
-                let slot = self
-                    .history
-                    .entry((report.provider.to_string(), window.label.clone()))
-                    .or_default();
-                slot.push_back(window.used_percent);
-                while slot.len() > 64 {
-                    slot.pop_front();
-                }
-            }
-        }
         self.reports = reports;
         self.last_refresh = Some(Instant::now());
         self.refreshing = false;
-    }
-
-    fn samples(&self, report: &Report, label: &str) -> Vec<f64> {
-        self.history
-            .get(&(report.provider.to_string(), label.to_string()))
-            .map(|slot| slot.iter().copied().collect())
-            .unwrap_or_default()
     }
 }
 
@@ -155,21 +132,6 @@ fn bar_spans(percent: f64, width: usize) -> Vec<Span<'static>> {
         }
     }
     spans
-}
-
-const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-/// Absolute 0-100 sparkline, so a flat line at 90% looks different from one at 5%.
-fn spark_spans(samples: &[f64], width: usize) -> Vec<Span<'static>> {
-    let take = samples.len().min(width);
-    let slice = &samples[samples.len() - take..];
-    slice
-        .iter()
-        .map(|value| {
-            let step = ((value.clamp(0.0, 100.0) / 100.0) * 7.0).round() as usize;
-            Span::styled(SPARK[step].to_string(), Style::default().fg(FAINT))
-        })
-        .collect()
 }
 
 fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -368,7 +330,7 @@ fn grid(frame: &mut Frame, app: &App, area: Rect) {
             )
             .split(rect);
         for (card_index, report) in row.iter().enumerate() {
-            card(frame, app, report, cells[card_index], density);
+            card(frame, report, cells[card_index], density);
         }
     }
 
@@ -472,7 +434,7 @@ fn card_height(report: &Report, density: Density) -> u16 {
 }
 
 /// One provider per line, showing whichever window is closest to its limit.
-fn row_line(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
+fn row_line(frame: &mut Frame, report: &Report, area: Rect) {
     let width = area.width as usize;
     if width < 16 {
         return;
@@ -494,12 +456,7 @@ fn row_line(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
     match tightest {
         Some(window) => {
             let label_width = 9.min(width / 5);
-            let spark_width = if app.samples(report, &window.label).len() >= 2 {
-                6.min(width / 10)
-            } else {
-                0
-            };
-            let reserved = name_width + label_width + 1 + 4 + 1 + spark_width;
+            let reserved = name_width + label_width + 1 + 4 + 1;
             let bar_width = width.saturating_sub(reserved).clamp(4, 40);
             spans.push(Span::styled(
                 pad(&window.label, label_width),
@@ -513,13 +470,6 @@ fn row_line(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
                     .fg(ramp(window.used_percent, 0.8))
                     .add_modifier(Modifier::BOLD),
             ));
-            if spark_width > 0 {
-                spans.push(Span::raw(" "));
-                spans.extend(spark_spans(
-                    &app.samples(report, &window.label),
-                    spark_width,
-                ));
-            }
         }
         None => {
             let note = match &report.health {
@@ -537,9 +487,9 @@ fn row_line(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Density) {
+fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
     if density == Density::Row {
-        row_line(frame, app, report, area);
+        row_line(frame, report, area);
         return;
     }
     let compact = density == Density::Compact;
@@ -607,12 +557,6 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Dens
     let now = Utc::now();
     let mut shown_reset: Option<DateTime<Utc>> = None;
     for window in &report.windows {
-        let samples = app.samples(report, &window.label);
-        let spark_width = if samples.len() >= 2 {
-            8.min(width / 6)
-        } else {
-            0
-        };
         let label_width = 10.min(width / 4);
 
         // Windows that share a billing cycle would otherwise repeat the same countdown on
@@ -634,7 +578,7 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Dens
         } else {
             0
         };
-        let reserved = label_width + 1 + 4 + 1 + spark_width + 1 + reset_width;
+        let reserved = label_width + 1 + 4 + 1 + reset_width;
         let bar_width = width.saturating_sub(reserved).clamp(6, 44);
 
         let mut row = vec![
@@ -649,17 +593,8 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Dens
                 .fg(ramp(window.used_percent, 0.8))
                 .add_modifier(Modifier::BOLD),
         ));
-        if spark_width > 0 {
-            row.push(Span::raw(" "));
-            row.extend(spark_spans(&samples, spark_width));
-        }
         if compact {
-            let used = label_width
-                + 1
-                + bar_width
-                + 1
-                + 4
-                + if spark_width > 0 { spark_width + 1 } else { 0 };
+            let used = label_width + 1 + bar_width + 1 + 4;
             let gap = width.saturating_sub(used + reset.chars().count());
             if !reset.is_empty() && gap > 0 {
                 row.push(Span::raw(" ".repeat(gap)));
