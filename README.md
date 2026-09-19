@@ -33,6 +33,31 @@ cargo run --release -- --interval 15
 
 Keys: `q` quit, `r` refresh now, `space` pause.
 
+### In a tmux pane
+
+It is a plain terminal program, so it drops straight into a pane with no nesting:
+
+```sh
+tmux split-window -h -l 84 'usagebar'      # 84-column side panel on the right
+```
+
+The layout adapts to whatever the pane gives it, in this order:
+
+| Pane | Drawing |
+| --- | --- |
+| Wide and tall | Panel per provider, bar plus reset line per window |
+| Narrow or short | Panel per provider, one line per window with the countdown inline |
+| Short enough that panels would be squeezed | One line per provider, tightest window only |
+
+It never shrinks panels until the numbers disappear. If even the last form runs out of rows,
+it says how many panels it is holding back instead of dropping them quietly.
+
+To see the UI without opening a terminal at all:
+
+```sh
+usagebar --render --sizes 80x24,140x45    # draw frames to stdout, ANSI and all
+```
+
 ## Notes
 
 The sparkline under each percentage is this tool's own readings over time, drawn on an

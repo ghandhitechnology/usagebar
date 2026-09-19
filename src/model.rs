@@ -54,7 +54,10 @@ pub enum Health {
     /// Responded, but the vendor did not report a quota for this account.
     NoQuota(String),
     /// Failed, and the windows on the report are the last good reading, not a fresh one.
-    Stale { why: String, since: std::time::Instant },
+    Stale {
+        why: String,
+        since: std::time::Instant,
+    },
     Unavailable(String),
 }
 

@@ -342,10 +342,7 @@ fn grid(frame: &mut Frame, app: &App, area: Rect) {
         _ => 1,
     };
     let rows: Vec<&[Report]> = app.reports.chunks(columns).collect();
-    let heights: Vec<u16> = rows
-        .iter()
-        .map(|row| row.iter().map(card_height).max().unwrap_or(4))
-        .collect();
+    let (density, heights, hidden) = plan(&rows, area.height, columns);
 
     let row_rects = Layout::default()
         .direction(Direction::Vertical)
@@ -357,9 +354,9 @@ fn grid(frame: &mut Frame, app: &App, area: Rect) {
         )
         .split(area);
 
-    for (row_index, row) in rows.iter().enumerate() {
+    for (row_index, row) in rows.iter().take(heights.len()).enumerate() {
         let rect = row_rects[row_index];
-        if rect.height < 3 {
+        if rect.height == 0 {
             continue;
         }
         let cells = Layout::default()
@@ -371,23 +368,181 @@ fn grid(frame: &mut Frame, app: &App, area: Rect) {
             )
             .split(rect);
         for (card_index, report) in row.iter().enumerate() {
-            card(frame, app, report, cells[card_index]);
+            card(frame, app, report, cells[card_index], density);
+        }
+    }
+
+    if hidden > 0 {
+        let used = heights.iter().map(|h| *h as usize).sum::<usize>() as u16;
+        let y = area.y + used;
+        if y < area.y + area.height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("+{hidden} more — enlarge the pane"),
+                    Style::default().fg(FAINT),
+                ))),
+                Rect { y, ..area },
+            );
         }
     }
 }
 
-fn card_height(report: &Report) -> u16 {
+/// Picks the densest drawing that still fits the pane, then drops whole rows that will not
+/// fit rather than letting the layout shrink every panel out of usefulness. Returns the
+/// density, the heights of the rows to draw, and how many panels were held back.
+fn plan(rows: &[&[Report]], height: u16, columns: usize) -> (Density, Vec<u16>, usize) {
+    let outcome = fit_density(rows, height, columns);
+    // A panel held back without a word is worse than one fewer panel, so re-plan with a row
+    // reserved for the notice whenever something had to be dropped.
+    match outcome.2 {
+        0 => outcome,
+        _ if height >= 3 => fit_density(rows, height - 1, columns),
+        _ => outcome,
+    }
+}
+
+fn fit_density(rows: &[&[Report]], height: u16, columns: usize) -> (Density, Vec<u16>, usize) {
+    let by_density = |density| row_heights(rows, density);
+    let (density, mut heights) = if fits(&by_density(Density::Full), height) {
+        (Density::Full, by_density(Density::Full))
+    } else if fits(&by_density(Density::Compact), height) {
+        (Density::Compact, by_density(Density::Compact))
+    } else {
+        (Density::Row, by_density(Density::Row))
+    };
+
+    let mut used = 0u16;
+    let mut keep = 0usize;
+    for row_height in &heights {
+        if used + row_height <= height {
+            used += row_height;
+            keep += 1;
+        } else {
+            break;
+        }
+    }
+    let hidden = (rows.len() - keep) * columns;
+    heights.truncate(keep);
+    (density, heights, hidden)
+}
+
+/// How much of each window a panel can afford to draw. Picked by what actually fits, so a
+/// short side panel still shows every provider instead of squeezing each one to nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Density {
+    /// Bar plus a reset line per window.
+    Full,
+    /// One line per window, countdown inline.
+    Compact,
+    /// One line per provider, tightest window only.
+    Row,
+}
+
+fn fits(heights: &[u16], budget: u16) -> bool {
+    heights.iter().map(|h| *h as usize).sum::<usize>() <= budget as usize
+}
+
+fn row_heights(rows: &[&[Report]], density: Density) -> Vec<u16> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|r| card_height(r, density))
+                .max()
+                .unwrap_or(1)
+        })
+        .collect()
+}
+
+fn card_height(report: &Report, density: Density) -> u16 {
+    if density == Density::Row {
+        return 1;
+    }
+    let per_window = match density {
+        Density::Full => 2,
+        _ => 1,
+    };
     let content = match &report.health {
         Health::Unavailable(_) => 2,
-        Health::Stale { .. } => report.windows.len() * 2 + 1,
+        Health::Stale { .. } => report.windows.len() * per_window + 1,
         Health::Ok | Health::NoQuota(_) => {
-            report.windows.len() * 2 + usize::from(!report.notes.is_empty())
+            report.windows.len() * per_window + usize::from(!report.notes.is_empty())
         }
     };
     (content + 2) as u16
 }
 
-fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
+/// One provider per line, showing whichever window is closest to its limit.
+fn row_line(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
+    let width = area.width as usize;
+    if width < 16 {
+        return;
+    }
+    let accent = provider_color(report.provider);
+    let name_width = 13.min(width / 4);
+
+    let tightest = report.windows.iter().max_by(|a, b| {
+        a.used_percent
+            .partial_cmp(&b.used_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut spans = vec![Span::styled(
+        pad(report.provider, name_width),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )];
+
+    match tightest {
+        Some(window) => {
+            let label_width = 9.min(width / 5);
+            let spark_width = if app.samples(report, &window.label).len() >= 2 {
+                6.min(width / 10)
+            } else {
+                0
+            };
+            let reserved = name_width + label_width + 1 + 4 + 1 + spark_width;
+            let bar_width = width.saturating_sub(reserved).clamp(4, 40);
+            spans.push(Span::styled(
+                pad(&window.label, label_width),
+                Style::default().fg(DIM),
+            ));
+            spans.extend(bar_spans(window.used_percent, bar_width));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{:>3.0}%", window.used_percent),
+                Style::default()
+                    .fg(ramp(window.used_percent, 0.8))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if spark_width > 0 {
+                spans.push(Span::raw(" "));
+                spans.extend(spark_spans(
+                    &app.samples(report, &window.label),
+                    spark_width,
+                ));
+            }
+        }
+        None => {
+            let note = match &report.health {
+                Health::Unavailable(why) => why.clone(),
+                Health::NoQuota(why) => why.clone(),
+                _ => "no windows".into(),
+            };
+            spans.push(Span::styled(
+                clip(&note, width.saturating_sub(name_width + 1)),
+                Style::default().fg(FAINT),
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Density) {
+    if density == Density::Row {
+        row_line(frame, app, report, area);
+        return;
+    }
+    let compact = density == Density::Compact;
     let accent = provider_color(report.provider);
     let healthy = matches!(report.health, Health::Ok | Health::Stale { .. });
 
@@ -403,10 +558,9 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
     }
     let badge = match (&report.plan, &report.health) {
         (Some(plan), _) => Span::styled(format!(" {} ", plan), Style::default().fg(DIM)),
-        (None, Health::Stale { .. }) => Span::styled(
-            " stale ",
-            Style::default().fg(Color::Rgb(0xD8, 0xA8, 0x57)),
-        ),
+        (None, Health::Stale { .. }) => {
+            Span::styled(" stale ", Style::default().fg(Color::Rgb(0xD8, 0xA8, 0x57)))
+        }
         (None, Health::Ok) => Span::styled(
             format!(" {} ", report.source.glyph()),
             Style::default().fg(FAINT),
@@ -460,7 +614,27 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
             0
         };
         let label_width = 10.min(width / 4);
-        let reserved = label_width + 1 + 4 + 1 + spark_width + 1;
+
+        // Windows that share a billing cycle would otherwise repeat the same countdown on
+        // every line of the card.
+        let reset = match window.resets_at {
+            Some(at) if Some(at) == shown_reset => String::new(),
+            Some(at) => {
+                shown_reset = Some(at);
+                countdown(at, now)
+            }
+            None if window.used_percent <= 0.0 => "idle".into(),
+            None => String::new(),
+        };
+
+        // In a narrow pane the countdown rides on the same line as the bar, which buys a
+        // whole line per window and keeps every provider visible.
+        let reset_width = if compact {
+            reset.chars().count().min(8) + 1
+        } else {
+            0
+        };
+        let reserved = label_width + 1 + 4 + 1 + spark_width + 1 + reset_width;
         let bar_width = width.saturating_sub(reserved).clamp(6, 44);
 
         let mut row = vec![
@@ -479,22 +653,34 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
             row.push(Span::raw(" "));
             row.extend(spark_spans(&samples, spark_width));
         }
-        lines.push(Line::from(row));
-
-        // Windows that share a billing cycle would otherwise repeat the same countdown on
-        // every line of the card.
-        let reset = match window.resets_at {
-            Some(at) if Some(at) == shown_reset => String::new(),
-            Some(at) => {
-                shown_reset = Some(at);
-                format!("resets in {}", countdown(at, now))
+        if compact {
+            let used = label_width
+                + 1
+                + bar_width
+                + 1
+                + 4
+                + if spark_width > 0 { spark_width + 1 } else { 0 };
+            let gap = width.saturating_sub(used + reset.chars().count());
+            if !reset.is_empty() && gap > 0 {
+                row.push(Span::raw(" ".repeat(gap)));
+                row.push(Span::styled(reset.clone(), Style::default().fg(DIM)));
             }
-            None if window.used_percent <= 0.0 => "idle".into(),
-            None => String::new(),
-        };
+        }
+        lines.push(Line::from(row));
+        if compact {
+            continue;
+        }
+
         let mut sub = vec![
             Span::raw(" ".repeat(label_width + 1)),
-            Span::styled(reset, Style::default().fg(DIM)),
+            Span::styled(
+                if reset.is_empty() {
+                    String::new()
+                } else {
+                    format!("resets in {reset}")
+                },
+                Style::default().fg(DIM),
+            ),
         ];
         if let Some(detail) = &window.detail {
             let used = label_width + 1 + sub[1].width();
@@ -586,5 +772,58 @@ mod tests {
         assert_eq!(spans.len(), 10);
         let filled = spans.iter().filter(|s| s.content == "█").count();
         assert_eq!(filled, 5);
+    }
+
+    fn sample_report(provider: &'static str, windows: usize) -> Report {
+        let mut report = Report::new(provider);
+        for index in 0..windows {
+            report.windows.push(Window::new(format!("W{index}"), 10.0));
+        }
+        report
+    }
+
+    /// A side panel is the whole point of the tool, so the plan must never squeeze panels
+    /// down: it drops to a lighter drawing or holds panels back, visibly.
+    #[test]
+    fn plan_falls_back_to_a_density_that_fits() {
+        let reports: Vec<Report> = ["A", "B", "C"]
+            .iter()
+            .map(|p| sample_report(p, 3))
+            .collect();
+        let rows: Vec<&[Report]> = reports.chunks(1).collect();
+
+        // Roomy: full drawing, three windows at two lines each plus borders.
+        let (density, heights, hidden) = plan(&rows, 40, 1);
+        assert_eq!(density, Density::Full);
+        assert_eq!(heights, vec![8, 8, 8]);
+        assert_eq!(hidden, 0);
+
+        // Tight: one line per window.
+        let (density, heights, hidden) = plan(&rows, 15, 1);
+        assert_eq!(density, Density::Compact);
+        assert_eq!(heights, vec![5, 5, 5]);
+        assert_eq!(hidden, 0);
+
+        // Tighter still: one line per provider.
+        let (density, heights, hidden) = plan(&rows, 6, 1);
+        assert_eq!(density, Density::Row);
+        assert_eq!(heights, vec![1, 1, 1]);
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn plan_reports_panels_it_could_not_fit() {
+        let reports: Vec<Report> = ["A", "B", "C", "D"]
+            .iter()
+            .map(|p| sample_report(p, 3))
+            .collect();
+        let rows: Vec<&[Report]> = reports.chunks(1).collect();
+
+        // Three rows of room for four panels: one row goes to the notice, the rest to
+        // panels, and nothing disappears without saying so.
+        let (density, heights, hidden) = plan(&rows, 3, 1);
+        assert_eq!(density, Density::Row);
+        assert_eq!(heights.len(), 2);
+        assert_eq!(hidden, 2);
     }
 }

@@ -1,7 +1,9 @@
 mod model;
 mod providers;
+mod render;
 mod ui;
 
+use std::io::IsTerminal;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,10 @@ fn main() -> std::io::Result<()> {
              \x20 --interval <SECS>   refresh cadence in the TUI (default {DEFAULT_INTERVAL})\n\
              \x20 --json             print one snapshot as JSON and exit\n\
              \x20 --once             print one snapshot as a table and exit\n\
+             \x20 --render           draw frames to stdout, for narrow panes and screenshots\n\
+             \x20 --width <COLS>     frame width for --render (default 80)\n\
+             \x20 --height <ROWS>    frame height for --render (default 24)\n\
+             \x20 --sizes <LIST>     several frames at once, e.g. 80x24,140x45\n\
              \x20 -h, --help         show this text\n"
         );
         return Ok(());
@@ -41,11 +47,50 @@ fn main() -> std::io::Result<()> {
         println!("{}", serde_json::to_string_pretty(&snapshot())?);
         return Ok(());
     }
+    if args.iter().any(|a| a == "--render") {
+        let width = flag(&args, "--width").unwrap_or(80).clamp(20, 400) as u16;
+        let height = flag(&args, "--height").unwrap_or(24).clamp(6, 200) as u16;
+        let sizes = match arg_value(&args, "--sizes") {
+            Some(list) => parse_sizes(&list).unwrap_or_else(|| vec![(width, height)]),
+            None => vec![(width, height)],
+        };
+        let mut app = App::new(interval);
+        app.absorb(providers::fetch_all());
+        for (w, h) in sizes {
+            println!("--- {w}x{h}");
+            print!("{}", render::to_ansi(w, h, &app).unwrap());
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--once") {
         print_table(&providers::fetch_all());
         return Ok(());
     }
     run_tui(interval)
+}
+
+fn flag(args: &[String], name: &str) -> Option<u64> {
+    arg_value(args, name).and_then(|v| v.parse().ok())
+}
+
+fn arg_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// "80x24,100x50" into frame sizes, so one fetch can show several pane shapes.
+fn parse_sizes(list: &str) -> Option<Vec<(u16, u16)>> {
+    list.split(',')
+        .map(|item| {
+            let (w, h) = item.trim().split_once(['x', 'X'])?;
+            Some((
+                w.trim().parse::<u16>().ok()?.clamp(20, 400),
+                h.trim().parse::<u16>().ok()?.clamp(6, 200),
+            ))
+        })
+        .collect()
 }
 
 fn snapshot() -> Value {
@@ -113,6 +158,13 @@ fn print_table(reports: &[Report]) {
 }
 
 fn run_tui(interval: u64) -> std::io::Result<()> {
+    // Without a terminal this would panic deep inside ratatui; say what to do instead.
+    if !std::io::stdout().is_terminal() {
+        eprintln!(
+            "usagebar: no terminal attached. Use --render for a frame, --once or --json for data."
+        );
+        std::process::exit(2);
+    }
     let mut app = App::new(interval);
     let (tx, rx) = mpsc::channel::<Vec<Report>>();
     trigger(&tx);
