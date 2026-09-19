@@ -163,7 +163,7 @@ pub fn draw(frame: &mut Frame, app: &App, detail: &Detail, area: Rect) {
     let box_area = ui::centered(area, width, height);
 
     let name = match &account.label {
-        Some(label) => format!("{} · {label}", account.provider.display()),
+        Some(label) => label.clone(),
         None => report
             .and_then(|report| report.account.clone())
             .map(|vendor| format!("{} · {vendor}", account.provider.display()))

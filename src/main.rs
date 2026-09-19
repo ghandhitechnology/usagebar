@@ -213,10 +213,7 @@ fn table(reports: &[Report]) -> String {
     let mut out = String::new();
     for report in reports {
         let plan = report.plan.clone().unwrap_or_default();
-        let name = match &report.label {
-            Some(label) => format!("{} · {label}", report.provider.display()),
-            None => report.provider.display().to_string(),
-        };
+        let name = report.name();
         out.push_str(&format!("{} {}\n", name, plan));
         match &report.health {
             Health::Ok => {}

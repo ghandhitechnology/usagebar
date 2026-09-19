@@ -79,6 +79,8 @@ impl Overlay {
             Overlay::Settings(settings) => {
                 if let Some(input) = settings.editing.as_mut() {
                     input.paste(text);
+                } else if let Some(rename) = settings.renaming.as_mut() {
+                    rename.input.paste(text);
                 }
             }
             Overlay::Wizard(wizard) => wizard.paste(text),
@@ -417,16 +419,16 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
             report
                 .windows
                 .iter()
-                .map(|window| (window.used_percent, report.provider, window))
+                .map(|window| (window.used_percent, report, window))
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         })
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut second = vec![Span::styled("  ", Style::default()), status];
-    if let Some((percent, provider, window)) = tightest {
+    if let Some((percent, report, window)) = tightest {
         second.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
         second.push(Span::styled(
-            format!("{} {} ", provider, window.label),
+            format!("{} {} ", report.name(), window.label),
             Style::default().fg(TEXT),
         ));
         second.push(Span::styled(
@@ -723,7 +725,7 @@ fn row_line(frame: &mut Frame, report: &Report, area: Rect) {
     });
 
     let mut spans = vec![Span::styled(
-        pad(report.provider.display(), name_width),
+        pad(&report.name(), name_width),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
 
@@ -771,14 +773,18 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
     let healthy = matches!(report.health, Health::Ok | Health::Stale { .. });
 
     let mut title = vec![Span::styled(
-        format!(" {} ", report.provider.display()),
+        format!(" {} ", report.name()),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
-    if let Some(name) = report.label.clone().or_else(|| report.account.clone()) {
-        title.push(Span::styled(
-            format!("{} ", crate::model::short_account(&name)),
-            Style::default().fg(FAINT),
-        ));
+    // Only an account without a name of its own needs the vendor's own account name
+    // beside it, to tell two logins of one provider apart.
+    if report.label.is_none() {
+        if let Some(vendor) = &report.account {
+            title.push(Span::styled(
+                format!("{} ", crate::model::short_account(vendor)),
+                Style::default().fg(FAINT),
+            ));
+        }
     }
     let badge = match (&report.plan, &report.health) {
         (Some(plan), _) => Span::styled(format!(" {} ", plan), Style::default().fg(DIM)),
@@ -981,6 +987,30 @@ mod tests {
             Health::Stale { why, .. } => assert_eq!(why, "HTTP 429"),
             other => panic!("expected stale, got {other:?}"),
         }
+    }
+
+    /// The name the user gave the account titles the panel; the provider's own name
+    /// steps aside instead of being printed next to it.
+    #[test]
+    fn a_named_account_titles_its_panel() {
+        let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
+        let mut report = Report::new(ProviderId::Claude)
+            .key("claude")
+            .label(Some("Chatgpt".into()));
+        report.windows.push(Window::new("Weekly", 42.0));
+        app.absorb(vec![report]);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Chatgpt"));
+        assert!(!text.contains("Claude"));
     }
 
     /// Two accounts of one provider are two panels, so one account's reading must not

@@ -133,6 +133,14 @@ impl AccountRef {
         self.problem = Some(problem.into());
         self
     }
+
+    /// What this account is called: the name the user gave it, or the provider's own
+    /// name standing in until they give it one.
+    pub fn name(&self) -> String {
+        self.label
+            .clone()
+            .unwrap_or_else(|| self.provider.display().to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +266,13 @@ impl Report {
     pub fn label(mut self, label: Option<String>) -> Self {
         self.label = label;
         self
+    }
+
+    /// The account's name, read off the report so a panel can title itself with it.
+    pub fn name(&self) -> String {
+        self.label
+            .clone()
+            .unwrap_or_else(|| self.provider.display().to_string())
     }
 
     pub fn account(mut self, account: Option<String>) -> Self {

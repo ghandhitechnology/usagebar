@@ -56,7 +56,8 @@ it drops the later entries rather than clipping the middle of one.
 ## Accounts and order
 
 One account is one panel. Two Claude logins, or two OpenCode Go keys, are two panels with
-their own readings and history.
+their own readings and history. An account goes by its provider's name until it is renamed;
+the name given replaces the provider's in the list, the panel titles and the header.
 
 `s` lists accounts in display order:
 
@@ -64,6 +65,7 @@ their own readings and history.
 | --- | --- |
 | `space` | show or hide the account |
 | `shift+↑` `shift+↓` | move it |
+| `r` | rename it; the name replaces the provider's everywhere, an empty name puts the provider's back |
 | `x` | remove it, twice, because that forgets its credentials |
 | `enter` | on a setting, change it |
 

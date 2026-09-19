@@ -887,14 +887,7 @@ fn welcome_lines(wizard: &Wizard, inner: Rect, lines: &mut Vec<Line>) {
             ),
             Span::styled("✓ ", Style::default().fg(Color::Rgb(0x5E, 0xB8, 0x8A))),
             Span::styled(
-                ui::pad(
-                    &format!(
-                        "{} {}",
-                        pending.account.provider.display(),
-                        pending.account.label.clone().unwrap_or_default()
-                    ),
-                    width.saturating_sub(14),
-                ),
+                ui::pad(&pending.account.name(), width.saturating_sub(14)),
                 Style::default().fg(TEXT),
             ),
             Span::styled(ui::clip(&pending.summary, 24), Style::default().fg(FAINT)),
@@ -1037,14 +1030,7 @@ fn done_lines(wizard: &Wizard, app: &App, inner: Rect, lines: &mut Vec<Line>) {
                     Color::Rgb(0x5E, 0xB8, 0x8A)
                 }),
             ),
-            Span::styled(
-                format!(
-                    "{} {}",
-                    pending.account.provider.display(),
-                    pending.account.label.clone().unwrap_or_default()
-                ),
-                Style::default().fg(DIM),
-            ),
+            Span::styled(pending.account.name(), Style::default().fg(DIM)),
             Span::styled(
                 if unchecked {
                     format!("  {}", ui::clip(&pending.summary, 40))
