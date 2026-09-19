@@ -1,9 +1,11 @@
 mod config;
 mod credentials;
 mod fsutil;
+mod input;
 mod model;
 mod providers;
 mod render;
+mod settings;
 mod ui;
 
 use std::io::IsTerminal;
@@ -11,13 +13,17 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+};
+use crossterm::execute;
 use serde_json::{json, Value};
 
 use config::{Config, SortMode};
 use credentials::{CredentialStore, FileStore, MemoryStore};
 use model::{AccountRef, Health, Report};
-use ui::App;
+use settings::Settings;
+use ui::{App, Overlay, OverlayAction};
 
 const DEFAULT_INTERVAL: u64 = config::DEFAULT_INTERVAL;
 
@@ -68,7 +74,11 @@ fn main() -> std::io::Result<()> {
         let (accounts, store) = boot(&config, &file_store);
         let mut app = App::new(interval, store, sort_mode(&config));
         app.accounts = accounts;
-        app.absorb(providers::fetch_all(&app.accounts, &app.store, app.sort));
+        app.absorb(providers::fetch_all(
+            &app.accounts,
+            &app.store,
+            app.config.sort,
+        ));
         for (w, h) in sizes {
             println!("--- {w}x{h}");
             print!("{}", render::to_ansi(w, h, &app).unwrap());
@@ -96,7 +106,7 @@ fn help() -> String {
          \x20 --height <ROWS>    frame height for --render (default 24)\n\
          \x20 --sizes <LIST>     several frames at once, e.g. 80x24,140x45\n\
          \x20 -h, --help         show this text\n\n\
-         KEYS: q quit · r refresh · space pause · s setup · d details\n\
+         KEYS: q quit · r refresh · space pause · s setup\n\
          Config: ~/.config/usagebar/config.json (override with USAGEBAR_CONFIG_DIR)\n"
     )
 }
@@ -113,9 +123,10 @@ fn boot(
     file_store: &Arc<FileStore>,
 ) -> (Vec<AccountRef>, Arc<dyn CredentialStore>) {
     match config {
-        Some(config) if !config.auto_detect() => {
-            (config.accounts.clone(), Arc::clone(file_store) as Arc<dyn CredentialStore>)
-        }
+        Some(config) if !config.auto_detect() => (
+            config.accounts.clone(),
+            Arc::clone(file_store) as Arc<dyn CredentialStore>,
+        ),
         _ => {
             let (accounts, store) = providers::accounts_from_detected(&providers::detect());
             (accounts, Arc::new(store) as Arc<dyn CredentialStore>)
@@ -237,17 +248,28 @@ fn run_tui(
         );
         std::process::exit(2);
     }
-    let accounts = config
+
+    let persisted = config.is_some();
+    let saved_accounts = config
         .as_ref()
         .filter(|config| !config.auto_detect())
         .map(|config| config.accounts.clone())
         .unwrap_or_default();
-    let store: Arc<dyn CredentialStore> = match &config {
-        Some(_) if !accounts.is_empty() => Arc::clone(&file_store) as Arc<dyn CredentialStore>,
-        _ => Arc::new(MemoryStore::new()),
+    let store: Arc<dyn CredentialStore> = if persisted && !saved_accounts.is_empty() {
+        Arc::clone(&file_store) as Arc<dyn CredentialStore>
+    } else {
+        Arc::new(MemoryStore::new())
     };
     let mut app = App::new(interval, store, sort_mode(&config));
-    app.accounts = accounts;
+    app.accounts = saved_accounts;
+    app.config = config.unwrap_or(Config {
+        interval_secs: interval,
+        sort: SortMode::Smart,
+        ..Config::default()
+    });
+    app.config_path = config::config_path(&config::dir());
+    app.persisted = persisted;
+    app.file_store = Arc::clone(&file_store);
     app.boot_note = config_error;
 
     let (tx, rx) = mpsc::channel::<Vec<Report>>();
@@ -258,21 +280,24 @@ fn run_tui(
         });
         true
     } else {
-        trigger(&tx, &app.accounts, &app.store, app.sort);
+        trigger(&tx, &app.accounts, &app.store, app.config.sort);
         app.refreshing = true;
         false
     };
 
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let tick = Duration::from_millis(120);
     let mut last_trigger = Instant::now();
     let result = loop {
         if scanning {
             if let Ok(detected) = scan_rx.try_recv() {
-                let (accounts, store) = providers::accounts_from_detected(&detected);
+                let (accounts, detected_store) = providers::accounts_from_detected(&detected);
+                let detected_store = Arc::new(detected_store);
                 app.accounts = accounts;
-                app.store = Arc::new(store);
-                trigger(&tx, &app.accounts, &app.store, app.sort);
+                app.store = Arc::clone(&detected_store) as Arc<dyn CredentialStore>;
+                app.detected_store = Some(detected_store);
+                trigger(&tx, &app.accounts, &app.store, app.config.sort);
                 app.refreshing = true;
                 last_trigger = Instant::now();
             }
@@ -282,7 +307,7 @@ fn run_tui(
         }
         let due = !app.paused && last_trigger.elapsed() >= Duration::from_secs(app.interval_secs);
         if due && !app.accounts.is_empty() {
-            trigger(&tx, &app.accounts, &app.store, app.sort);
+            trigger(&tx, &app.accounts, &app.store, app.config.sort);
             app.refreshing = true;
             last_trigger = Instant::now();
         }
@@ -294,17 +319,37 @@ fn run_tui(
         if event::poll(tick)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if app.overlay.is_none() {
+                    if let Some(mut overlay) = app.overlay.take() {
+                        let action = overlay.handle(&mut app, key);
+                        match action {
+                            OverlayAction::Close => {}
+                            OverlayAction::Keep => app.overlay = Some(overlay),
+                            OverlayAction::Refresh => {
+                                app.overlay = Some(overlay);
+                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
+                                app.refreshing = true;
+                                last_trigger = Instant::now();
+                            }
+                        }
+                    } else {
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                             KeyCode::Char('r') => {
-                                trigger(&tx, &app.accounts, &app.store, app.sort);
+                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
                                 app.refreshing = true;
                                 last_trigger = Instant::now();
                             }
                             KeyCode::Char(' ') => app.paused = !app.paused,
+                            KeyCode::Char('s') => {
+                                app.overlay = Some(Overlay::Settings(Settings::default()))
+                            }
                             _ => {}
                         }
+                    }
+                }
+                Event::Paste(text) => {
+                    if let Some(overlay) = app.overlay.as_mut() {
+                        overlay.paste(&text);
                     }
                 }
                 Event::Resize(_, _) => {}
@@ -313,6 +358,7 @@ fn run_tui(
         }
     };
 
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }

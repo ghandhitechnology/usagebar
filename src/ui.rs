@@ -1,19 +1,22 @@
 //! Rendering. A dense panel grid with vendor-accurate numbers, tuned for a dark terminal.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
 
-use crate::config::SortMode;
-use crate::credentials::CredentialStore;
+use crate::config::{self, Config, SortMode};
+use crate::credentials::{CredentialStore, FileStore, MemoryStore};
 use crate::model::{AccountRef, Health, ProviderId, Report};
+use crate::settings::{self, Settings};
 
 pub struct App {
     pub reports: Vec<Report>,
@@ -27,17 +30,57 @@ pub struct App {
     /// Accounts in display order, and the secrets they read from.
     pub accounts: Vec<AccountRef>,
     pub store: Arc<dyn CredentialStore>,
-    pub sort: SortMode,
+    /// The saved preferences. `accounts` mirrors this list whenever a config exists.
+    pub config: Config,
+    pub config_path: PathBuf,
+    /// False until a config has been written; onboarding starts when it never was.
+    pub persisted: bool,
+    /// Always the on-disk credential store; writes go here.
+    pub file_store: Arc<FileStore>,
+    /// Credentials found by the startup scan but not yet committed to the store.
+    pub detected_store: Option<Arc<MemoryStore>>,
     /// Anything the user should hear about at startup, e.g. an unreadable config.
     pub boot_note: Option<String>,
     pub overlay: Option<Overlay>,
 }
 
 /// The modal screens. One at a time; the base view owns every key when this is None.
-pub enum Overlay {}
+pub enum Overlay {
+    Settings(Settings),
+}
+
+impl Overlay {
+    pub fn handle(&mut self, app: &mut App, key: KeyEvent) -> OverlayAction {
+        match self {
+            Overlay::Settings(settings) => match settings::handle(settings, app, key) {
+                settings::Action::Keep => OverlayAction::Keep,
+                settings::Action::Close => OverlayAction::Close,
+                settings::Action::Refresh => OverlayAction::Refresh,
+            },
+        }
+    }
+
+    /// A paste goes to whatever field is focused in the open overlay.
+    pub fn paste(&mut self, text: &str) {
+        match self {
+            Overlay::Settings(settings) => {
+                if let Some(input) = settings.editing.as_mut() {
+                    input.paste(text);
+                }
+            }
+        }
+    }
+}
+
+pub enum OverlayAction {
+    Keep,
+    Close,
+    Refresh,
+}
 
 impl App {
     pub fn new(interval_secs: u64, store: Arc<dyn CredentialStore>, sort: SortMode) -> Self {
+        let dir = config::dir();
         Self {
             reports: Vec::new(),
             history: HashMap::new(),
@@ -47,10 +90,54 @@ impl App {
             interval_secs,
             accounts: Vec::new(),
             store,
-            sort,
+            config: Config {
+                interval_secs,
+                sort,
+                ..Config::default()
+            },
+            config_path: config::config_path(&dir),
+            persisted: false,
+            file_store: Arc::new(FileStore::load(config::credentials_path(&dir))),
+            detected_store: None,
             boot_note: None,
             overlay: None,
         }
+    }
+
+    /// Write the preferences. Returns the error for the overlay to show, if any.
+    pub fn save_config(&mut self) -> Option<String> {
+        match config::save(&self.config_path, &self.config) {
+            Ok(()) => {
+                self.persisted = true;
+                None
+            }
+            Err(why) => Some(why),
+        }
+    }
+
+    /// The user changed which accounts are shown or their order. Accounts that only
+    /// existed as a scan result are committed to the credential store here, because an
+    /// account the user kept has to survive a restart.
+    pub fn save_accounts(&mut self, accounts: Vec<AccountRef>) -> Option<String> {
+        self.accounts = accounts;
+        self.config.accounts = self.accounts.clone();
+        for account in &self.accounts {
+            if self.file_store.get(&account.id).is_none() {
+                if let Some(stored) = self
+                    .detected_store
+                    .as_ref()
+                    .and_then(|store| store.get(&account.id))
+                {
+                    self.file_store.put(&account.id, stored);
+                }
+            }
+        }
+        self.store = Arc::clone(&self.file_store) as Arc<dyn CredentialStore>;
+        self.save_config()
+    }
+
+    pub fn forget_credentials(&self, account_id: &str) {
+        self.file_store.remove(account_id);
     }
 
     pub fn absorb(&mut self, reports: Vec<Report>) {
@@ -117,10 +204,10 @@ impl App {
 
 // ------------------------------------------------------------------ palette
 
-const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
-const DIM: Color = Color::Rgb(0x6B, 0x6F, 0x7A);
-const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
-const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
+pub(crate) const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
+pub(crate) const DIM: Color = Color::Rgb(0x6B, 0x6F, 0x7A);
+pub(crate) const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
+pub(crate) const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
 const TRACK: Color = Color::Rgb(0x33, 0x36, 0x3D);
 
 fn provider_color(provider: ProviderId) -> Color {
@@ -190,7 +277,7 @@ fn spark_spans(samples: &[f64], width: usize) -> Vec<Span<'static>> {
         .collect()
 }
 
-fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
+pub(crate) fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let seconds = (reset - now).num_seconds();
     if seconds <= 0 {
         return "now".into();
@@ -209,7 +296,7 @@ fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-fn clip(text: &str, width: usize) -> String {
+pub(crate) fn clip(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
     }
@@ -221,7 +308,7 @@ fn clip(text: &str, width: usize) -> String {
     out
 }
 
-fn pad(text: &str, width: usize) -> String {
+pub(crate) fn pad(text: &str, width: usize) -> String {
     let clipped = clip(text, width);
     let len = clipped.chars().count();
     format!("{clipped}{}", " ".repeat(width.saturating_sub(len)))
@@ -243,6 +330,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     header(frame, app, chunks[0]);
     grid(frame, app, chunks[1]);
     footer(frame, app, chunks[2]);
+    match &app.overlay {
+        Some(Overlay::Settings(settings)) => settings::draw(frame, app, settings, area),
+        None => {}
+    }
 }
 
 fn header(frame: &mut Frame, app: &App, area: Rect) {
@@ -326,19 +417,28 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter(|r| matches!(r.health, Health::Ok))
         .count();
-    let keys = Line::from(vec![
+    let mut spans = vec![
         Span::styled(" q ", Style::default().fg(ACCENT)),
         Span::styled("quit ", Style::default().fg(DIM)),
         Span::styled(" r ", Style::default().fg(ACCENT)),
         Span::styled("refresh now ", Style::default().fg(DIM)),
         Span::styled(" space ", Style::default().fg(ACCENT)),
         Span::styled("pause ", Style::default().fg(DIM)),
-        Span::styled(
+        Span::styled(" s ", Style::default().fg(ACCENT)),
+        Span::styled("setup ", Style::default().fg(DIM)),
+    ];
+    if let Some(note) = &app.boot_note {
+        spans.push(Span::styled(
+            format!(" {}", clip(note, area.width.saturating_sub(46) as usize)),
+            Style::default().fg(Color::Rgb(0xD8, 0xA8, 0x57)),
+        ));
+    } else {
+        spans.push(Span::styled(
             format!(" {ok}/{} reporting", app.reports.len()),
             Style::default().fg(FAINT),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(keys), area);
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Cards flow left to right, wrapping into rows; a row is as tall as its tallest card.
