@@ -22,6 +22,20 @@ instead of inventing a figure.
 Providers without credentials are simply absent. A provider that fails keeps its own error
 text on its panel.
 
+## Install
+
+```sh
+cargo install --path . --root ~/.local   # puts usagebar in ~/.local/bin
+ln -sf usagebar ~/.local/bin/usge        # shorter name to type
+```
+
+Then either name works from any directory:
+
+```sh
+usge                # TUI
+usge --once         # one snapshot as text
+```
+
 ## Run
 
 ```sh
@@ -38,7 +52,7 @@ Keys: `q` quit, `r` refresh now, `space` pause.
 It is a plain terminal program, so it drops straight into a pane with no nesting:
 
 ```sh
-tmux split-window -h -l 84 'usagebar'      # 84-column side panel on the right
+tmux split-window -h -l 84 'usge'          # 84-column side panel on the right
 ```
 
 The layout adapts to whatever the pane gives it, in this order:
