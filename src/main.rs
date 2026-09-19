@@ -10,7 +10,7 @@ mod settings;
 mod ui;
 mod wizard;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -33,8 +33,7 @@ const DEFAULT_INTERVAL: u64 = config::DEFAULT_INTERVAL;
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{}", help());
-        return Ok(());
+        return out(&help());
     }
 
     let dir = config::dir();
@@ -62,11 +61,8 @@ fn main() -> std::io::Result<()> {
 
     if args.iter().any(|a| a == "--json") {
         let (accounts, store) = boot(&config, &file_store);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&snapshot(&accounts, &store, sort_mode(&config)))?
-        );
-        return Ok(());
+        let snapshot = snapshot(&accounts, &store, sort_mode(&config));
+        return out(&format!("{}\n", serde_json::to_string_pretty(&snapshot)?));
     }
     if args.iter().any(|a| a == "--render") {
         let width = flag(&args, "--width").unwrap_or(80).clamp(20, 400) as u16;
@@ -83,16 +79,17 @@ fn main() -> std::io::Result<()> {
             &app.store,
             app.config.sort,
         ));
+        let mut frames = String::new();
         for (w, h) in sizes {
-            println!("--- {w}x{h}");
-            print!("{}", render::to_ansi(w, h, &app).unwrap());
+            frames.push_str(&format!("--- {w}x{h}\n"));
+            frames.push_str(&render::to_ansi(w, h, &app).unwrap());
         }
-        return Ok(());
+        return out(&frames);
     }
     if args.iter().any(|a| a == "--once") {
         let (accounts, store) = boot(&config, &file_store);
-        print_table(&providers::fetch_all(&accounts, &store, sort_mode(&config)));
-        return Ok(());
+        let table = table(&providers::fetch_all(&accounts, &store, sort_mode(&config)));
+        return out(&table);
     }
     run_tui(interval, config, config_error, file_store, cli_interval.is_some())
 }
@@ -203,39 +200,51 @@ fn report_json(report: &Report) -> Value {
     })
 }
 
-fn print_table(reports: &[Report]) {
+fn table(reports: &[Report]) -> String {
+    let mut out = String::new();
     for report in reports {
         let plan = report.plan.clone().unwrap_or_default();
         let name = match &report.label {
             Some(label) => format!("{} · {label}", report.provider.display()),
             None => report.provider.display().to_string(),
         };
-        println!("{} {}", name, plan);
+        out.push_str(&format!("{} {}\n", name, plan));
         match &report.health {
             Health::Ok => {}
-            Health::NoQuota(why) => println!("  no quota reported: {why}"),
-            Health::Stale { why, since } => {
-                println!("  stale ({}s ago): {why}", since.elapsed().as_secs())
-            }
-            Health::Unavailable(why) => println!("  unavailable: {why}"),
+            Health::NoQuota(why) => out.push_str(&format!("  no quota reported: {why}\n")),
+            Health::Stale { why, since } => out.push_str(&format!(
+                "  stale ({}s ago): {why}\n",
+                since.elapsed().as_secs()
+            )),
+            Health::Unavailable(why) => out.push_str(&format!("  unavailable: {why}\n")),
         }
         for window in &report.windows {
-            println!(
-                "  {:<16} {:>5.1}%  {}",
+            out.push_str(&format!(
+                "  {:<16} {:>5.1}%  {}\n",
                 window.label,
                 window.used_percent,
                 window
                     .resets_at
                     .map(|t| format!("resets {}", t.to_rfc3339()))
                     .unwrap_or_default()
-            );
+            ));
         }
         for fact in report.facts.iter().filter(|fact| fact.panel) {
-            println!("  {} {}", fact.label, fact.value);
+            out.push_str(&format!("  {} {}\n", fact.label, fact.value));
         }
         for note in &report.notes {
-            println!("  {note}");
+            out.push_str(&format!("  {note}\n"));
         }
+    }
+    out
+}
+
+/// A reader that goes away (`usge --once | head`) is not a failure.
+fn out(text: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(text.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
     }
 }
 
