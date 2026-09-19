@@ -476,36 +476,89 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![line, Line::from(second)]), area);
 }
 
+/// The bottom bar: what to press here, for the screen that is open.
 fn footer(frame: &mut Frame, app: &App, area: Rect) {
-    let ok = app
-        .reports
-        .iter()
-        .filter(|r| matches!(r.health, Health::Ok))
-        .count();
-    let mut spans = vec![
-        Span::styled(" q ", Style::default().fg(ACCENT)),
-        Span::styled("quit ", Style::default().fg(DIM)),
-        Span::styled(" r ", Style::default().fg(ACCENT)),
-        Span::styled("refresh now ", Style::default().fg(DIM)),
-        Span::styled(" space ", Style::default().fg(ACCENT)),
-        Span::styled("pause ", Style::default().fg(DIM)),
-        Span::styled(" s ", Style::default().fg(ACCENT)),
-        Span::styled("setup ", Style::default().fg(DIM)),
-        Span::styled(" d ", Style::default().fg(ACCENT)),
-        Span::styled("details ", Style::default().fg(DIM)),
-    ];
-    if let Some(note) = &app.boot_note {
-        spans.push(Span::styled(
-            format!(" {}", clip(note, area.width.saturating_sub(46) as usize)),
-            Style::default().fg(Color::Rgb(0xD8, 0xA8, 0x57)),
-        ));
-    } else {
-        spans.push(Span::styled(
-            format!(" {ok}/{} reporting", app.reports.len()),
-            Style::default().fg(FAINT),
-        ));
+    let (guide, tail) = match &app.overlay {
+        None => (
+            vec![
+                ("q".to_string(), "quit".to_string()),
+                ("r".to_string(), "refresh".to_string()),
+                ("space".to_string(), "pause".to_string()),
+                ("s".to_string(), "setup".to_string()),
+                ("d".to_string(), "details".to_string()),
+            ],
+            Some(match &app.boot_note {
+                Some(note) => Span::styled(
+                    format!(" {note}"),
+                    Style::default().fg(Color::Rgb(0xD8, 0xA8, 0x57)),
+                ),
+                None => {
+                    let ok = app
+                        .reports
+                        .iter()
+                        .filter(|r| matches!(r.health, Health::Ok))
+                        .count();
+                    Span::styled(
+                        format!(" {ok}/{} reporting", app.reports.len()),
+                        Style::default().fg(FAINT),
+                    )
+                }
+            }),
+        ),
+        Some(Overlay::Settings(_)) => (settings::keys(), None),
+        Some(Overlay::Wizard(wizard)) => (wizard::keys(wizard), None),
+        Some(Overlay::Detail(detail)) => (crate::detail::keys(app, detail), None),
+    };
+
+    let width = area.width as usize;
+    let tail_width = tail.as_ref().map(|span| span.width()).unwrap_or(0);
+    let mut spans = key_guide(&guide, width.saturating_sub(tail_width + 1));
+    if let Some(tail) = tail {
+        let used: usize = spans.iter().map(|span| span.width()).sum();
+        let gap = width.saturating_sub(used + tail.width());
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(tail);
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// " q quit · r refresh ", dropping entries that do not fit. A pane too narrow for one
+/// entry still gets the keys themselves, which is the part a newcomer needs.
+fn key_guide(entries: &[(String, String)], width: usize) -> Vec<Span<'static>> {
+    let cost = |index: usize| {
+        let (key, action) = &entries[index];
+        key.chars().count() + action.chars().count() + 2 + if index > 0 { 2 } else { 0 }
+    };
+    let mut budget = 0usize;
+    let mut keep = 0usize;
+    for index in 0..entries.len() {
+        let next = cost(index);
+        if budget + next > width {
+            break;
+        }
+        budget += next;
+        keep += 1;
+    }
+    if keep == 0 {
+        let bare: String = entries
+            .iter()
+            .map(|(key, _)| format!(" {key}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return vec![Span::styled(clip(&bare, width), Style::default().fg(ACCENT))];
+    }
+    let mut spans = Vec::new();
+    for (index, (key, action)) in entries.iter().take(keep).enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" ·", Style::default().fg(FAINT)));
+        }
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default().fg(ACCENT),
+        ));
+        spans.push(Span::styled(action.clone(), Style::default().fg(DIM)));
+    }
+    spans
 }
 
 /// Cards flow left to right, wrapping into rows; a row is as tall as its tallest card.

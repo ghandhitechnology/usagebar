@@ -735,19 +735,15 @@ pub fn draw(frame: &mut Frame, app: &App, wizard: &Wizard, area: Rect) {
         Step::Connect => connect_lines(wizard, inner, &mut lines, &mut cursor),
         Step::Done => done_lines(wizard, app, inner, &mut lines),
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        ui::clip(&footer_hint(wizard), inner.width as usize),
-        Style::default().fg(if wizard.note.is_some() { ACCENT } else { FAINT }),
-    )));
     let note = wizard
         .note
         .clone()
         .or_else(|| wizard.connect.as_ref().and_then(|c| c.error.clone()));
     if let Some(note) = note {
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             ui::clip(&note, inner.width as usize),
-            Style::default().fg(DIM),
+            Style::default().fg(ACCENT),
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -756,24 +752,51 @@ pub fn draw(frame: &mut Frame, app: &App, wizard: &Wizard, area: Rect) {
     }
 }
 
-fn footer_hint(wizard: &Wizard) -> String {
+/// What the bottom bar shows while this screen is open, one line per step.
+pub fn keys(wizard: &Wizard) -> Vec<(String, String)> {
+    let pair = |key: &str, action: &str| (key.to_string(), action.to_string());
     if wizard.verifying {
-        return "checking with the vendor…".into();
+        return vec![pair("esc", "cancel the check")];
     }
     match wizard.step {
-        Step::Welcome => "↑↓ move · space select · a connect another · enter continue".into(),
-        Step::Provider => "↑↓ choose · enter connect · esc back".into(),
+        Step::Welcome if wizard.first_run => vec![
+            pair("↑↓", "move"),
+            pair("space", "include"),
+            pair("a", "connect another"),
+            pair("enter", "continue"),
+            pair("esc", "skip"),
+        ],
+        Step::Welcome => vec![
+            pair("↑↓", "move"),
+            pair("space", "remove"),
+            pair("a", "connect another"),
+            pair("enter", "continue"),
+            pair("esc", "cancel"),
+        ],
+        Step::Provider => vec![
+            pair("↑↓", "choose"),
+            pair("enter", "connect"),
+            pair("esc", "back"),
+        ],
         Step::Connect => {
             let connect = wizard.connect.as_ref();
+            let mut keys = vec![pair("↑↓", "field"), pair("ctrl+r", "reveal")];
             if connect.is_some_and(|connect| connect.verified.is_some()) {
-                "enter save this account · esc back".into()
+                keys.push(pair("enter", "save this account"));
             } else if connect.is_some_and(|connect| connect.error.is_some()) {
-                "enter save anyway · type to fix · esc back".into()
+                keys.push(pair("enter", "save anyway"));
+                keys.push(pair("type", "fix"));
             } else {
-                "↑↓ next field · ctrl+r reveal · enter check · esc back".into()
+                keys.push(pair("enter", "check"));
             }
+            keys.push(pair("esc", "back"));
+            keys
         }
-        Step::Done => "t switch sort · enter save · esc back".into(),
+        Step::Done => vec![
+            pair("t", "sort"),
+            pair("enter", "save"),
+            pair("esc", "back"),
+        ],
     }
 }
 

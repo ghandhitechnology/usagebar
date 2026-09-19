@@ -49,6 +49,10 @@ every account later writes `"detect": false`, so an empty list is a choice, not 
 | `s` | setup: accounts, order, sort mode, interval |
 | `d` | details for one account, `←` `→` to walk accounts |
 
+The bottom bar always shows the controls for the screen that is open, so the wizard and
+the setup overlay explain themselves as you go. In a pane too narrow for the whole guide
+it drops the later entries rather than clipping the middle of one.
+
 ## Accounts and order
 
 One account is one panel. Two Claude logins, or two OpenCode Go keys, are two panels with

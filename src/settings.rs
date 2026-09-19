@@ -30,6 +30,17 @@ pub enum Action {
     OpenWizard,
 }
 
+/// What the bottom bar shows while this screen is open.
+pub fn keys() -> Vec<(String, String)> {
+    vec![
+        ("↑↓".into(), "move".into()),
+        ("space".into(), "show/hide".into()),
+        ("shift+↑↓".into(), "reorder".into()),
+        ("x".into(), "remove".into()),
+        ("esc".into(), "close".into()),
+    ]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Account(usize),
@@ -309,20 +320,12 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
         lines.push(line);
     }
     lines.push(Line::from(""));
-    let hint = match &settings.note {
-        Some(note) => Line::from(Span::styled(
+    if let Some(note) = &settings.note {
+        lines.push(Line::from(Span::styled(
             ui::clip(note, inner.width as usize),
             Style::default().fg(ACCENT),
-        )),
-        None => Line::from(Span::styled(
-            ui::clip(
-                "space show/hide · shift+↑↓ move · x remove · saved as you go",
-                inner.width as usize,
-            ),
-            Style::default().fg(FAINT),
-        )),
-    };
-    lines.push(hint);
+        )));
+    }
 
     frame.render_widget(Paragraph::new(lines), inner);
     if let Some(input) = &settings.editing {

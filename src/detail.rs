@@ -29,7 +29,7 @@ impl Detail {
 
 /// Accounts in the order the panels are drawn, so walking left to right in the detail
 /// view matches walking across the grid.
-fn visible(app: &App) -> Vec<&AccountRef> {
+pub fn visible(app: &App) -> Vec<&AccountRef> {
     let shown = |id: &str| {
         app.accounts
             .iter()
@@ -42,6 +42,20 @@ fn visible(app: &App) -> Vec<&AccountRef> {
         }
     }
     out
+}
+
+/// What the bottom bar shows while this screen is open.
+pub fn keys(app: &App, detail: &Detail) -> Vec<(String, String)> {
+    let count = visible(app).len();
+    let position = if count == 0 {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", detail.index.min(count - 1) + 1, count)
+    };
+    vec![
+        ("←/→".into(), format!("account {position}")),
+        ("esc".into(), "close".into()),
+    ]
 }
 
 pub fn handle(detail: &mut Detail, app: &mut App, key: KeyEvent) -> Action {
@@ -145,18 +159,8 @@ pub fn draw(frame: &mut Frame, app: &App, detail: &Detail, area: Rect) {
         Span::styled("  refreshed    ", Style::default().fg(DIM)),
         Span::styled(refreshed, Style::default().fg(FAINT)),
     ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  ←/→ account {}/{} · esc close",
-            index + 1,
-            accounts.len()
-        ),
-        Style::default().fg(FAINT),
-    )));
 
-    let height = (lines.len() + 2)
-        .min(area.height.saturating_sub(2) as usize) as u16;
+    let height = (lines.len() + 2).min(area.height.saturating_sub(2) as usize) as u16;
     let box_area = ui::centered(area, width, height);
 
     let name = match &account.label {
@@ -261,7 +265,6 @@ fn health_detail(health: &Health) -> Option<String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +332,16 @@ mod tests {
             .collect();
         assert!(text.contains("token rejected"));
         assert!(text.contains("unavailable"));
+    }
+
+    /// The bottom bar carries the controls, including which account is on screen.
+    #[test]
+    fn keys_name_the_account_and_its_position() {
+        let mut app = app_with_report(Report::new(ProviderId::Codex).key("codex"));
+        app.accounts.push(AccountRef::new("claude", ProviderId::Claude));
+        let keys = keys(&app, &Detail::new());
+        assert_eq!(keys[0].0, "←/→");
+        assert!(keys[0].1.contains("1/2"), "{:?}", keys[0]);
+        assert_eq!(keys[1].0, "esc");
     }
 }
