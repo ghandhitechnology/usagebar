@@ -13,7 +13,7 @@ instead of inventing a figure.
 | --- | --- | --- |
 | Claude | `GET api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | OAuth pair from `~/.claude/.credentials.json`, refreshed and written back in place |
 | Codex | `GET chatgpt.com/backend-api/wham/usage`; falls back to the last `rate_limits` snapshot in `~/.codex/sessions` | `~/.codex/auth.json` |
-| OpenCode Go | `GET opencode.ai/zen/go/v1/usage` per key | `credential` table in `~/.local/share/opencode/opencode.db` |
+| OpenCode Go | `GET opencode.ai/zen/go/v1/usage` per key | the `credential` table in `~/.local/share/opencode/opencode.db`, or a Go key pasted by hand |
 | Cursor | `GET cursor.com/api/usage-summary` | `~/.cursor/auth.json`, cookie built as `sub::jwt` |
 | Grok | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` | `~/.grok/auth.json` |
 | Devin | `POST server.codeium.com/.../GetUserStatus` (Connect RPC), remaining flipped to used | `windsurf_api_key` in `~/.local/share/devin/credentials.toml` |
@@ -26,12 +26,20 @@ Vendor paths follow the vendor's own environment overrides (`CLAUDE_CONFIG_DIR`,
 ## Setup
 
 The first run scans the machine and opens with what it found. `space` toggles a credential,
-`a` connects a provider by hand, enter goes to the finish screen.
+`a` connects a provider by hand, enter goes to the finish screen — except on a row the scan
+could not make a credential out of, where enter opens that provider's connect screen so one
+can be typed in.
 
 Connecting by hand takes a file path or a pasted secret. Every manual connection is checked
 against the vendor before it saves, and a check that fails can still be saved with a second
 enter, which is what to do when a vendor is rate limiting rather than wrong. A check only
 reads: it never refreshes or rewrites a credential, so walking away from one costs nothing.
+
+OpenCode Go is the one provider with no credential file of its own. The scan reads the keys
+in the OpenCode store and keeps the ones the Go endpoint answers for; any other Go key — a
+second subscription, one bought elsewhere, one OpenCode has never seen — is pasted into its
+connect screen instead, and becomes an account of its own, with the same per-window numbers
+and the same name field as every other account.
 
 Nothing is written until the finish screen. Esc skips setup and records that choice as
 `"detect": true` with an empty account list, which means "keep scanning each run"; removing

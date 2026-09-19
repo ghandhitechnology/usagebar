@@ -62,7 +62,22 @@ pub struct Connect {
     pub error: Option<String>,
 }
 
+/// What a connect field means. The form is assembled per provider, so everything else
+/// asks for a role instead of an index: OpenCode Go has no vendor file to point at, which
+/// makes its form shorter than the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// A vendor file to import from, for the providers that keep one.
+    Config,
+    Access,
+    Refresh,
+    AccountId,
+    Token,
+    Name,
+}
+
 pub struct Field {
+    pub role: Role,
     pub label: &'static str,
     pub input: TextInput,
 }
@@ -126,9 +141,14 @@ impl Wizard {
                     connect.verified = Some(summary.clone());
                     connect.error = None;
                     // A blank name field takes the vendor's own account name.
-                    if let Some(label) = connect.fields.last_mut().filter(|f| f.input.is_blank()) {
+                    if let Some(name) = connect
+                        .fields
+                        .iter_mut()
+                        .find(|field| field.role == Role::Name)
+                        .filter(|field| field.input.is_blank())
+                    {
                         if let Some(account) = &report.account {
-                            label.input.set(account.clone());
+                            name.input.set(account.clone());
                         }
                     }
                 }
@@ -177,6 +197,16 @@ impl Wizard {
 /// The wizard's rows, so hit-testing and drawing cannot drift apart.
 fn welcome_rows(wizard: &Wizard) -> usize {
     wizard.detected.len() + wizard.pending.len() + 1
+}
+
+/// The provider of the selected scan row, when the scan found the file but no usable
+/// credential in it. Enter connects that provider by hand rather than continuing.
+fn unusable_provider(wizard: &Wizard) -> Option<ProviderId> {
+    wizard
+        .detected
+        .get(wizard.welcome_row)
+        .filter(|entry| entry.credential.is_none())
+        .map(|entry| entry.provider)
 }
 
 pub fn handle(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
@@ -230,6 +260,14 @@ fn welcome(wizard: &mut Wizard, _app: &mut App, key: KeyEvent) -> Action {
             if wizard.welcome_row == add_row {
                 wizard.step = Step::Provider;
                 wizard.provider_pick = 0;
+                return Action::Keep;
+            }
+            if let Some(provider) = unusable_provider(wizard) {
+                // Nothing to include here, but this row is the whole reason the provider
+                // is missing: open its form so the credential can be typed in.
+                wizard.connect = Some(Connect::new(provider));
+                wizard.step = Step::Connect;
+                wizard.note = None;
                 return Action::Keep;
             }
             wizard.step = Step::Done;
@@ -336,11 +374,10 @@ fn save_connect(wizard: &mut Wizard, app: &mut App) -> Action {
         let Ok((credential, origin)) = connect.build(connect.provider) else {
             return Action::Keep;
         };
-        let label = connect
-            .fields
-            .last()
-            .map(|field| field.input.value().trim().to_string())
-            .filter(|value| !value.is_empty());
+        let label = match connect.value(Role::Name) {
+            name if name.is_empty() => None,
+            name => Some(name),
+        };
         (credential, origin, connect.provider, label)
     };
     let summary = match wizard.connect.as_ref() {
@@ -599,25 +636,55 @@ fn find_existing(
 
 impl Connect {
     pub fn new(provider: ProviderId) -> Self {
-        let path = credentials::vendor_file(provider)
-            .filter(|path| path.exists())
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
-        let mut fields = vec![Field::new("Local config", TextInput::with_value(path))];
+        let mut fields = Vec::new();
+        if let Some(path) = credentials::vendor_file(provider) {
+            // Prefilled when the file is there; a path that is not stays an empty field.
+            let path = if path.exists() {
+                path.display().to_string()
+            } else {
+                String::new()
+            };
+            fields.push(Field::new(
+                Role::Config,
+                "Local config",
+                TextInput::with_value(path),
+            ));
+        }
         match provider {
             ProviderId::Claude => {
-                fields.push(Field::new("Access token", TextInput::new().secret()));
-                fields.push(Field::new("Refresh token", TextInput::new().secret()));
+                fields.push(Field::new(
+                    Role::Access,
+                    "Access token",
+                    TextInput::new().secret(),
+                ));
+                fields.push(Field::new(
+                    Role::Refresh,
+                    "Refresh token",
+                    TextInput::new().secret(),
+                ));
             }
             ProviderId::Codex => {
-                fields.push(Field::new("Access token", TextInput::new().secret()));
-                fields.push(Field::new("Account id", TextInput::new()));
+                fields.push(Field::new(
+                    Role::Access,
+                    "Access token",
+                    TextInput::new().secret(),
+                ));
+                fields.push(Field::new(Role::AccountId, "Account id", TextInput::new()));
+            }
+            // A Go key is not a file: the scan reads the keys the OpenCode store holds,
+            // and a key that is anywhere else is simply pasted in. One key, one account.
+            ProviderId::OpenCodeGo => {
+                fields.push(Field::new(
+                    Role::Token,
+                    "API key",
+                    TextInput::new().secret(),
+                ));
             }
             _ => {
-                fields.push(Field::new("Token", TextInput::new().secret()));
+                fields.push(Field::new(Role::Token, "Token", TextInput::new().secret()));
             }
         }
-        fields.push(Field::new("Name", TextInput::new()));
+        fields.push(Field::new(Role::Name, "Name", TextInput::new()));
         Self {
             provider,
             fields,
@@ -627,19 +694,23 @@ impl Connect {
         }
     }
 
+    /// What a field holds, trimmed. Roles rather than positions, so dropping a field for
+    /// one provider cannot shift what another provider's field means.
+    fn value(&self, role: Role) -> String {
+        self.fields
+            .iter()
+            .find(|field| field.role == role)
+            .map(|field| field.input.value().trim().to_string())
+            .unwrap_or_default()
+    }
+
     /// A pasted secret wins over the file field, so the prefilled path stays a
     /// convenience rather than something to clear out first.
     pub fn build(&self, provider: ProviderId) -> Result<(Credential, Option<PathBuf>), String> {
-        let field = |index: usize| {
-            self.fields
-                .get(index)
-                .map(|field| field.input.value().trim().to_string())
-                .unwrap_or_default()
-        };
-        let path = field(0);
+        let path = self.value(Role::Config);
         let pasted = match provider {
             ProviderId::Claude => {
-                let (access, refresh) = (field(1), field(2));
+                let (access, refresh) = (self.value(Role::Access), self.value(Role::Refresh));
                 if access.is_empty() && refresh.is_empty() {
                     None
                 } else if access.is_empty() || refresh.is_empty() {
@@ -654,11 +725,11 @@ impl Connect {
                 }
             }
             ProviderId::Codex => {
-                let access = field(1);
+                let access = self.value(Role::Access);
                 if access.is_empty() {
                     None
                 } else {
-                    let account_id = field(2);
+                    let account_id = self.value(Role::AccountId);
                     Some(Credential::CodexTokens {
                         access_token: access,
                         account_id: (!account_id.is_empty()).then_some(account_id),
@@ -667,7 +738,7 @@ impl Connect {
                 }
             }
             _ => {
-                let token = field(1);
+                let token = self.value(Role::Token);
                 (!token.is_empty()).then_some(Credential::Token { token })
             }
         };
@@ -683,14 +754,15 @@ impl Connect {
         Err(match provider {
             ProviderId::Claude => "give a credentials file, or both tokens".into(),
             ProviderId::Codex => "give an auth.json path, or an access token".into(),
+            ProviderId::OpenCodeGo => "paste a Go API key".into(),
             _ => "give a credentials file, or paste a token".into(),
         })
     }
 }
 
 impl Field {
-    fn new(label: &'static str, input: TextInput) -> Self {
-        Self { label, input }
+    fn new(role: Role, label: &'static str, input: TextInput) -> Self {
+        Self { role, label, input }
     }
 }
 
@@ -771,19 +843,25 @@ pub fn keys(wizard: &Wizard) -> Vec<(String, String)> {
     if wizard.verifying {
         return vec![pair("esc", "cancel the check")];
     }
+    // On a row the scan could not make a credential out of, enter opens that provider's
+    // form instead of moving on, and the bar says so.
+    let enter = match unusable_provider(wizard) {
+        Some(_) => "connect it",
+        None => "continue",
+    };
     match wizard.step {
         Step::Welcome if wizard.first_run => vec![
             pair("↑↓", "move"),
             pair("space", "include"),
             pair("a", "connect another"),
-            pair("enter", "continue"),
+            pair("enter", enter),
             pair("esc", "skip"),
         ],
         Step::Welcome => vec![
             pair("↑↓", "move"),
             pair("space", "remove"),
             pair("a", "connect another"),
-            pair("enter", "continue"),
+            pair("enter", enter),
             pair("esc", "cancel"),
         ],
         Step::Provider => vec![
@@ -1073,9 +1151,31 @@ fn done_lines(wizard: &Wizard, app: &App, inner: Rect, lines: &mut Vec<Line>) {
 mod tests {
     use super::*;
     use crate::credentials::FileStore;
+    use crossterm::event::KeyModifiers;
 
     fn account(id: &str, provider: ProviderId) -> AccountRef {
         AccountRef::new(id, provider)
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("usagebar-wiz-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Type into the field that means this, whichever position it ended up in.
+    fn set(connect: &mut Connect, role: Role, value: &str) {
+        connect
+            .fields
+            .iter_mut()
+            .find(|field| field.role == role)
+            .expect("the form has that field")
+            .input
+            .set(value);
+    }
+
+    fn press(wizard: &mut Wizard, app: &mut App, code: KeyCode) -> Action {
+        handle(wizard, app, KeyEvent::new(code, KeyModifiers::NONE))
     }
 
     fn app_with(dir: &std::path::Path) -> App {
@@ -1093,13 +1193,12 @@ mod tests {
 
     #[test]
     fn building_from_fields_prefers_a_paste_then_a_file() {
-        let dir = std::env::temp_dir().join(format!("usagebar-wiz-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("build");
         let file = dir.join("auth.json");
         std::fs::write(&file, r#"{"accessToken":"from-file"}"#).unwrap();
 
         let mut connect = Connect::new(ProviderId::Cursor);
-        connect.fields[0].input.set(file.display().to_string());
+        set(&mut connect, Role::Config, &file.display().to_string());
         let (credential, origin) = connect.build(ProviderId::Cursor).unwrap();
         assert_eq!(
             credential,
@@ -1110,7 +1209,7 @@ mod tests {
         assert_eq!(origin.as_deref(), Some(file.as_path()));
 
         // A pasted token wins over the prefilled path, so nothing has to be cleared.
-        connect.fields[1].input.set("pasted");
+        set(&mut connect, Role::Token, "pasted");
         let (credential, origin) = connect.build(ProviderId::Cursor).unwrap();
         assert_eq!(
             credential,
@@ -1120,17 +1219,133 @@ mod tests {
         );
         assert!(origin.is_none());
 
-        connect.fields[0].input.set("");
-        connect.fields[1].input.set("");
+        set(&mut connect, Role::Config, "");
+        set(&mut connect, Role::Token, "");
         assert!(connect.build(ProviderId::Cursor).is_err());
 
         // Claude needs the pair, not just half of it.
         let mut connect = Connect::new(ProviderId::Claude);
-        connect.fields[0].input.set("");
-        connect.fields[1].input.set("access-only");
+        set(&mut connect, Role::Config, "");
+        set(&mut connect, Role::Access, "access-only");
         assert!(connect.build(ProviderId::Claude).is_err());
-        connect.fields[2].input.set("refresh");
+        set(&mut connect, Role::Refresh, "refresh");
         assert!(connect.build(ProviderId::Claude).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// OpenCode Go keeps no credential file of its own, so its form is the key itself:
+    /// no path to point at, and a key that no store on the machine has to know about.
+    #[test]
+    fn an_opencode_go_key_is_typed_in_rather_than_imported() {
+        let mut connect = Connect::new(ProviderId::OpenCodeGo);
+        assert!(!connect
+            .fields
+            .iter()
+            .any(|field| field.role == Role::Config));
+        assert_eq!(connect.fields[0].role, Role::Token);
+        assert_eq!(connect.fields[0].label, "API key");
+        assert_eq!(
+            connect.build(ProviderId::OpenCodeGo).unwrap_err(),
+            "paste a Go API key"
+        );
+
+        set(&mut connect, Role::Token, "  sk-go-somewhere-else  ");
+        let (credential, origin) = connect.build(ProviderId::OpenCodeGo).unwrap();
+        assert_eq!(
+            credential,
+            Credential::Token {
+                token: "sk-go-somewhere-else".into()
+            }
+        );
+        // Nothing to follow it back to: the key is the whole credential.
+        assert!(origin.is_none());
+    }
+
+    /// The scan can find OpenCode installed without finding a Go key it can use. That
+    /// row is where the key gets typed in, so enter on it opens the provider's form.
+    #[test]
+    fn a_row_with_no_credential_opens_its_connect_screen() {
+        let dir = scratch("unusable-row");
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new(
+            vec![Detected {
+                provider: ProviderId::OpenCodeGo,
+                credential: None,
+                origin: None,
+                error: Some("no working OpenCode Go key in the local store".into()),
+            }],
+            SortMode::Manual,
+        );
+        // The row cannot be included, and the guide says what enter does with it.
+        assert_eq!(wizard.total(), 0);
+        assert!(keys(&wizard).contains(&("enter".to_string(), "connect it".to_string())));
+
+        assert!(matches!(
+            press(&mut wizard, &mut app, KeyCode::Enter),
+            Action::Keep
+        ));
+        assert_eq!(wizard.step, Step::Connect);
+        let connect = wizard.connect.as_ref().unwrap();
+        assert_eq!(connect.provider, ProviderId::OpenCodeGo);
+        assert_eq!(connect.fields[0].role, Role::Token);
+
+        // Backing out returns to the list rather than saving anything.
+        press(&mut wizard, &mut app, KeyCode::Esc);
+        assert_eq!(wizard.step, Step::Provider);
+        assert_eq!(wizard.total(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A key typed in by hand becomes an account of its own, named as the user named it.
+    #[test]
+    fn a_typed_go_key_becomes_an_account() {
+        let dir = scratch("go-account");
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        let mut connect = Connect::new(ProviderId::OpenCodeGo);
+        set(&mut connect, Role::Token, "sk-go-1");
+        set(&mut connect, Role::Name, " shared key ");
+        connect.verified = Some("connected".into());
+        wizard.connect = Some(connect);
+
+        assert!(matches!(save_connect(&mut wizard, &mut app), Action::Keep));
+        assert_eq!(wizard.step, Step::Welcome);
+        assert_eq!(wizard.pending.len(), 1);
+        let pending = &wizard.pending[0];
+        assert_eq!(pending.account.provider, ProviderId::OpenCodeGo);
+        assert_eq!(pending.account.id, "opencode-go");
+        assert_eq!(pending.account.label.as_deref(), Some("shared key"));
+        assert_eq!(
+            pending.credential,
+            Credential::Token {
+                token: "sk-go-1".into()
+            }
+        );
+        assert!(pending.origin.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two keys typed in by hand are two accounts, not one that replaces the other.
+    #[test]
+    fn each_typed_go_key_gets_its_own_account() {
+        let dir = scratch("go-accounts");
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        for key in ["sk-go-1", "sk-go-2"] {
+            let mut connect = Connect::new(ProviderId::OpenCodeGo);
+            set(&mut connect, Role::Token, key);
+            connect.verified = Some("connected".into());
+            wizard.connect = Some(connect);
+            save_connect(&mut wizard, &mut app);
+        }
+        assert_eq!(
+            wizard
+                .pending
+                .iter()
+                .map(|pending| pending.account.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opencode-go", "opencode-go-2"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1206,6 +1421,37 @@ mod tests {
             vec!["claude", "codex"]
         );
         assert!(app.file_store.get("codex").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Go form draws the key where the other providers draw their file field, and
+    /// says what to do with it.
+    #[test]
+    fn the_go_form_draws_a_key_field_and_no_path() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = scratch("go-draw");
+        let app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        wizard.step = Step::Connect;
+        wizard.connect = Some(Connect::new(ProviderId::OpenCodeGo));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &wizard, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Connect OpenCode Go"), "{text}");
+        assert!(text.contains("API key"), "{text}");
+        assert!(!text.contains("Local config"), "{text}");
+        // And the connect form is what the bottom bar is describing.
+        assert!(keys(&wizard).contains(&("enter".to_string(), "check".to_string())));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

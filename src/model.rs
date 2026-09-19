@@ -83,7 +83,7 @@ impl ProviderId {
                 "OAuth pair from Claude Code, or an import of its credentials file"
             }
             ProviderId::Codex => "tokens from the Codex CLI's auth.json",
-            ProviderId::OpenCodeGo => "a Go API key from the OpenCode credential store",
+            ProviderId::OpenCodeGo => "a Go API key, pasted here or from the store",
             ProviderId::Cursor => "the access token from cursor-agent's auth.json",
             ProviderId::Grok => "the session key from the Grok CLI's auth.json",
             ProviderId::Devin => "the windsurf_api_key from Devin's credentials.toml",
