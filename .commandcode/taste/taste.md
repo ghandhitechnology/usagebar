@@ -6,7 +6,7 @@
 - A user-supplied name/label should replace the derived (provider/model) text everywhere it appears — in rows and panel titles — rather than be rendered alongside it as `Provider Name` duplication. Confidence: 0.7
 - When the user says "rename," they mean replacing the entity's name, not tagging/appending a secondary label beside it; they expect the agent to honor the literal semantics of such terms rather than a looser interpretation. Confidence: 0.6
 - Reacts with frustration when a change leaves an obviously redundant/undesired UI artifact, and when the agent instead offers to implement the sensible interpretation as an optional follow-up rather than just doing it. Confidence: 0.55
-- Wants finished work committed to git as its own step before moving on (e.g. "Good, commit that"); committing is part of the expected workflow, not something left dangling uncommitted. Confidence: 0.55
+- Wants finished work committed to git as its own step before moving on (e.g. "Good, commit that", "commit first before continuing"); committing is part of the expected workflow, not something left dangling uncommitted while the next task starts. Confidence: 0.7
 - Delivers work as a sequence of discrete features, one per request, and expects the current feature to be closed out before the next one starts. Confidence: 0.45
 - Expects accounts of the same provider to share one visual identity and to be grouped/aggregated together in any cross-account view, with per-provider styling routed through a single shared source (colour, labels) so every surface agrees. Confidence: 0.55
 - Keeps a fixed provider colour palette for charts/legends — Codex blue, Claude orange, OpenCode Go dark blue, Devin white, Command Code purple. Confidence: 0.5

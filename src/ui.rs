@@ -50,7 +50,8 @@ pub struct App {
 /// The modal screens. One at a time; the base view owns every key when this is None.
 pub enum Overlay {
     Settings(Settings),
-    Wizard(Wizard),
+    /// Boxed: the wizard is the one overlay with a whole form's state in it.
+    Wizard(Box<Wizard>),
     Detail(crate::detail::Detail),
 }
 

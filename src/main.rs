@@ -4,6 +4,7 @@ mod detail;
 mod fsutil;
 mod input;
 mod model;
+mod oauth;
 mod providers;
 mod render;
 mod settings;
@@ -331,7 +332,10 @@ fn run_tui(
                 app.detected_store = Some(detected_store);
                 // Nothing saved yet means this is the first run; offer setup.
                 if !app.persisted && app.overlay.is_none() {
-                    app.overlay = Some(Overlay::Wizard(Wizard::new(detected, app.config.sort)));
+                    app.overlay = Some(Overlay::Wizard(Box::new(Wizard::new(
+                        detected,
+                        app.config.sort,
+                    ))));
                 }
                 trigger(&tx, &app.accounts, &app.store, app.config.sort);
                 app.refreshing = true;
@@ -403,8 +407,9 @@ fn run_tui(
                                 last_trigger = Instant::now();
                             }
                             OverlayAction::OpenWizard => {
-                                app.overlay =
-                                    Some(Overlay::Wizard(Wizard::new_add(app.config.sort)));
+                                app.overlay = Some(Overlay::Wizard(Box::new(Wizard::new_add(
+                                    app.config.sort,
+                                ))));
                             }
                         }
                     } else {

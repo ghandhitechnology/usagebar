@@ -11,8 +11,8 @@ instead of inventing a figure.
 
 | Provider | Source | Credential |
 | --- | --- | --- |
-| Claude | `GET api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | OAuth pair from `~/.claude/.credentials.json`, refreshed and written back in place |
-| Codex | `GET chatgpt.com/backend-api/wham/usage`; falls back to the last `rate_limits` snapshot in `~/.codex/sessions` | `~/.codex/auth.json` |
+| Claude | `GET api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | a browser sign-in, a pasted OAuth pair, or `~/.claude/.credentials.json`, refreshed and written back in place |
+| Codex | `GET chatgpt.com/backend-api/wham/usage`; falls back to the last `rate_limits` snapshot in `~/.codex/sessions` | a browser sign-in, a pasted token, or `~/.codex/auth.json` |
 | OpenCode Go | `GET opencode.ai/zen/go/v1/usage` per key | the `credential` table in `~/.local/share/opencode/opencode.db`, or a Go key pasted by hand |
 | Cursor | `GET cursor.com/api/usage-summary` | `~/.cursor/auth.json`, cookie built as `sub::jwt` |
 | Grok | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` | `~/.grok/auth.json` |
@@ -40,6 +40,23 @@ in the OpenCode store and keeps the ones the Go endpoint answers for; any other 
 second subscription, one bought elsewhere, one OpenCode has never seen — is pasted into its
 connect screen instead, and becomes an account of its own, with the same per-window numbers
 and the same name field as every other account.
+
+### Signing in with a browser
+
+Claude and Codex also have a sign-in, on `o` from their connect screens, for an account that
+is not signed in on this machine at all. It uses the same client each vendor's own CLI uses,
+and the same flow:
+
+- **Codex** serves the browser's callback on `localhost:1455`, so the credential arrives on
+  its own; the account id comes out of the id_token and is sent with every usage call.
+- **Claude** has no loopback redirect, so its page shows a code; paste it into the sign-in
+  field (`code#state` is fine, the code is the part before the hash) and press enter.
+
+Either way the credential is read back once before the screen says it worked, and it is
+stored like any other — there is no file behind it. A signed-in Codex pair is refreshed when
+it expires, because rotating it is the only way that connection stays alive; a pair imported
+from the Codex CLI is never touched, since the CLI rotates its own and would otherwise be
+signed out from under the user.
 
 Nothing is written until the finish screen. Esc skips setup and records that choice as
 `"detect": true` with an empty account list, which means "keep scanning each run"; removing

@@ -79,10 +79,8 @@ impl ProviderId {
     /// One line on how this provider is connected, shown while picking a provider.
     pub fn connect_hint(self) -> &'static str {
         match self {
-            ProviderId::Claude => {
-                "OAuth pair from Claude Code, or an import of its credentials file"
-            }
-            ProviderId::Codex => "tokens from the Codex CLI's auth.json",
+            ProviderId::Claude => "browser sign-in, a pasted token pair, or Claude Code's file",
+            ProviderId::Codex => "browser sign-in, a pasted token, or the Codex CLI's auth.json",
             ProviderId::OpenCodeGo => "a Go API key, pasted here or from the store",
             ProviderId::Cursor => "the access token from cursor-agent's auth.json",
             ProviderId::Grok => "the session key from the Grok CLI's auth.json",

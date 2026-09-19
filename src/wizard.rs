@@ -60,6 +60,35 @@ pub struct Connect {
     /// The vendor's answer after a successful check.
     pub verified: Option<String>,
     pub error: Option<String>,
+    /// A browser sign-in in flight, if the user started one.
+    pub signin: Option<SignIn>,
+    /// The credential that sign-in produced. It was already read back successfully, so
+    /// saving it needs no further check.
+    pub signed_in: Option<Credential>,
+}
+
+/// A sign-in running in the background: what to open, where the code goes, and the
+/// worker that turns the answer into a credential.
+pub struct SignIn {
+    inner: crate::oauth::SignIn,
+    /// Where a vendor that shows the code instead of calling back puts it.
+    pub code: TextInput,
+    /// True while only the browser can move this along.
+    pub waiting: bool,
+    rx: Option<Receiver<Result<(Credential, Report), String>>>,
+}
+
+impl SignIn {
+    /// What the screen says while this is running.
+    pub fn status(&self) -> String {
+        if self.waiting {
+            return "waiting for the browser to come back…".into();
+        }
+        if self.rx.is_some() {
+            return "exchanging the code…".into();
+        }
+        "approve in the browser, then paste the code it shows".into()
+    }
 }
 
 /// What a connect field means. The form is assembled per provider, so everything else
@@ -119,59 +148,91 @@ impl Wizard {
         wizard
     }
 
-    /// Called every tick so a background check can land without blocking the UI.
+    /// Called every tick so a background check or sign-in can land without blocking the
+    /// UI.
     pub fn poll(&mut self) {
-        let Some(rx) = &self.verify_rx else {
+        self.poll_check();
+        self.poll_signin();
+    }
+
+    fn poll_check(&mut self) {
+        let outcome = match &self.verify_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("the check stopped before it answered".into()))
+                }
+            },
+            None => None,
+        };
+        let Some(outcome) = outcome else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(report)) => {
-                self.verifying = false;
-                self.verify_rx = None;
-                let who = report.account.clone().or_else(|| report.label.clone());
-                let plan = report.plan.clone().unwrap_or_default();
-                let summary = match (who, plan.is_empty()) {
-                    (Some(who), false) if who == plan => plan,
-                    (Some(who), false) => format!("{who} · {plan}"),
-                    (Some(who), true) => who,
-                    (None, false) => plan,
-                    (None, true) => "connected".into(),
+        self.verifying = false;
+        self.verify_rx = None;
+        match outcome {
+            Ok(report) => {
+                let summary = match self.connect.as_mut() {
+                    Some(connect) => adopt(connect, &report),
+                    None => String::new(),
                 };
-                if let Some(connect) = self.connect.as_mut() {
-                    connect.verified = Some(summary.clone());
-                    connect.error = None;
-                    // A blank name field takes the vendor's own account name.
-                    if let Some(name) = connect
-                        .fields
-                        .iter_mut()
-                        .find(|field| field.role == Role::Name)
-                        .filter(|field| field.input.is_blank())
-                    {
-                        if let Some(account) = &report.account {
-                            name.input.set(account.clone());
-                        }
-                    }
-                }
                 self.note = Some(format!("checked: {summary}"));
             }
-            Ok(Err(why)) => {
-                self.verifying = false;
-                self.verify_rx = None;
+            Err(why) => {
                 if let Some(connect) = self.connect.as_mut() {
                     connect.error = Some(why);
                     connect.verified = None;
                 }
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.verifying = false;
-                self.verify_rx = None;
+        }
+    }
+
+    /// A sign-in that has run its course: the credential it produced, and the account it
+    /// read back.
+    fn poll_signin(&mut self) {
+        let outcome = {
+            let Some(rx) = self
+                .connect
+                .as_ref()
+                .and_then(|connect| connect.signin.as_ref())
+                .and_then(|signin| signin.rx.as_ref())
+            else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("the sign-in stopped before it answered".into())
+                }
+            }
+        };
+        let Some(connect) = self.connect.as_mut() else {
+            return;
+        };
+        connect.signin = None;
+        match outcome {
+            Ok((credential, report)) => {
+                connect.signed_in = Some(credential);
+                let summary = adopt(connect, &report);
+                self.note = Some(format!("signed in: {summary}"));
+            }
+            Err(why) => {
+                connect.signed_in = None;
+                connect.verified = None;
+                connect.error = Some(why);
             }
         }
     }
 
     pub fn paste(&mut self, text: &str) {
         if let Some(connect) = self.connect.as_mut() {
+            // While a sign-in is open, the pasted text is the code from the browser.
+            if let Some(signin) = connect.signin.as_mut() {
+                signin.code.paste(text);
+                return;
+            }
             if let Some(field) = connect.fields.get_mut(connect.focus) {
                 field.input.paste(text);
                 connect.verified = None;
@@ -207,6 +268,33 @@ fn unusable_provider(wizard: &Wizard) -> Option<ProviderId> {
         .get(wizard.welcome_row)
         .filter(|entry| entry.credential.is_none())
         .map(|entry| entry.provider)
+}
+
+/// Put the vendor's answer on the connect form: the line that says what was found, and
+/// the account's own name when the form has not been given one.
+fn adopt(connect: &mut Connect, report: &Report) -> String {
+    let who = report.account.clone().or_else(|| report.label.clone());
+    let plan = report.plan.clone().unwrap_or_default();
+    let summary = match (who, plan.is_empty()) {
+        (Some(who), false) if who == plan => plan,
+        (Some(who), false) => format!("{who} · {plan}"),
+        (Some(who), true) => who,
+        (None, false) => plan,
+        (None, true) => "connected".into(),
+    };
+    connect.verified = Some(summary.clone());
+    connect.error = None;
+    if let Some(name) = connect
+        .fields
+        .iter_mut()
+        .find(|field| field.role == Role::Name)
+        .filter(|field| field.input.is_blank())
+    {
+        if let Some(account) = &report.account {
+            name.input.set(account.clone());
+        }
+    }
+    summary
 }
 
 pub fn handle(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
@@ -304,11 +392,19 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
         wizard.step = Step::Provider;
         return Action::Keep;
     };
+    // A sign-in owns the keys while it is open: it is the only thing on this screen that
+    // can still change, and the field it fills is not one of the form's own.
+    if connect.signin.is_some() {
+        return signin_keys(wizard, key);
+    }
     match key.code {
         KeyCode::Esc => {
             wizard.step = Step::Provider;
             wizard.connect = None;
             wizard.note = None;
+        }
+        KeyCode::Char('o') if providers::oauth_spec(connect.provider).is_some() => {
+            return start_signin(wizard);
         }
         KeyCode::Up => {
             connect.focus = connect.focus.saturating_sub(1);
@@ -328,9 +424,10 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
             if let Some(field) = connect.fields.get_mut(connect.focus) {
                 if field.input.handle_key(key) {
                     // Typing in the name does not invalidate the check; changing a
-                    // credential does.
+                    // credential does, and a credential that came from a sign-in too.
                     if connect.focus + 1 < connect.fields.len() {
                         connect.verified = None;
+                        connect.signed_in = None;
                     }
                     connect.error = None;
                 }
@@ -338,6 +435,131 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
         }
     }
     Action::Keep
+}
+
+/// Open the vendor's own sign-in page and listen for what it sends back.
+fn start_signin(wizard: &mut Wizard) -> Action {
+    let Some(connect) = wizard.connect.as_mut() else {
+        return Action::Keep;
+    };
+    let Some(spec) = providers::oauth_spec(connect.provider) else {
+        connect.error = Some(format!(
+            "{} has no browser sign-in",
+            connect.provider.display()
+        ));
+        return Action::Keep;
+    };
+    let signin = match crate::oauth::SignIn::start(spec) {
+        Ok(signin) => signin,
+        Err(why) => {
+            connect.error = Some(why);
+            return Action::Keep;
+        }
+    };
+    // The port is taken before the browser opens, so a sign-in that cannot be received
+    // fails here rather than in the browser.
+    let (rx, waiting) = if signin.calls_back() {
+        let provider = connect.provider;
+        let verifier = signin.verifier().to_string();
+        match signin.listen() {
+            Ok(code_rx) => {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let outcome = match code_rx.recv() {
+                        Ok(Ok(code)) => finish_signin(provider, &code, &verifier),
+                        Ok(Err(why)) => Err(why),
+                        // The listener only goes away when the user stopped waiting,
+                        // which the wizard has already done by then.
+                        Err(_) => Err("the sign-in stopped before the browser answered".into()),
+                    };
+                    let _ = tx.send(outcome);
+                });
+                (Some(rx), true)
+            }
+            Err(why) => {
+                connect.error = Some(why);
+                return Action::Keep;
+            }
+        }
+    } else {
+        (None, false)
+    };
+    let url = signin.url.clone();
+    connect.signed_in = None;
+    connect.verified = None;
+    connect.error = None;
+    connect.signin = Some(SignIn {
+        inner: signin,
+        code: TextInput::new(),
+        waiting,
+        rx,
+    });
+    crate::oauth::open_browser(&url);
+    wizard.note = Some(format!("signing in · {url}"));
+    Action::Keep
+}
+
+/// While a sign-in is open, every key belongs to it.
+fn signin_keys(wizard: &mut Wizard, key: KeyEvent) -> Action {
+    let Some(connect) = wizard.connect.as_mut() else {
+        return Action::Keep;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(signin) = connect.signin.take() {
+                signin.inner.cancel();
+            }
+            connect.signed_in = None;
+            wizard.note = None;
+        }
+        KeyCode::Enter => {
+            let Some(signin) = connect.signin.as_mut() else {
+                return Action::Keep;
+            };
+            if signin.waiting || signin.code.is_blank() {
+                return Action::Keep;
+            }
+            // The code the browser showed, which is all this flow can hand back.
+            let code = pasted_code(signin.code.value());
+            let verifier = signin.inner.verifier().to_string();
+            let provider = connect.provider;
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(finish_signin(provider, &code, &verifier));
+            });
+            signin.rx = Some(rx);
+        }
+        _ => {
+            if let Some(signin) = connect.signin.as_mut() {
+                signin.code.handle_key(key);
+            }
+        }
+    }
+    Action::Keep
+}
+
+/// Trade the code for a credential and read the account once, so what the form shows is
+/// what the vendor will actually answer with.
+fn finish_signin(
+    provider: ProviderId,
+    code: &str,
+    verifier: &str,
+) -> Result<(Credential, Report), String> {
+    let credential = providers::oauth_exchange(provider, code, verifier)?;
+    let report = providers::verify(provider, &credential, None)?;
+    Ok((credential, report))
+}
+
+/// The code the browser showed, as the token exchange wants it. Claude's page hands back
+/// "code#state", and the code is the part before the hash: the state there is the one the
+/// page echoed, not the one this sign-in generated.
+fn pasted_code(value: &str) -> String {
+    value
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Start the live check on a worker thread; the answer arrives via poll().
@@ -371,8 +593,19 @@ fn save_connect(wizard: &mut Wizard, app: &mut App) -> Action {
         let Some(connect) = wizard.connect.as_ref() else {
             return Action::Keep;
         };
-        let Ok((credential, origin)) = connect.build(connect.provider) else {
-            return Action::Keep;
+        let (credential, origin) = match connect.signed_in.clone() {
+            // A signed-in credential has no file behind it, and needs no check: it has
+            // already been read back once.
+            Some(credential) => (credential, None),
+            None => match connect.build(connect.provider) {
+                Ok(built) => built,
+                Err(why) => {
+                    if let Some(connect) = wizard.connect.as_mut() {
+                        connect.error = Some(why);
+                    }
+                    return Action::Keep;
+                }
+            },
         };
         let label = match connect.value(Role::Name) {
             name if name.is_empty() => None,
@@ -691,6 +924,8 @@ impl Connect {
             focus: 0,
             verified: None,
             error: None,
+            signin: None,
+            signed_in: None,
         }
     }
 
@@ -734,6 +969,7 @@ impl Connect {
                         access_token: access,
                         account_id: (!account_id.is_empty()).then_some(account_id),
                         refresh_token: None,
+                        expires_at: 0,
                     })
                 }
             }
@@ -776,7 +1012,16 @@ pub fn draw(frame: &mut Frame, app: &App, wizard: &Wizard, area: Rect) {
         Step::Connect => wizard
             .connect
             .as_ref()
-            .map(|connect| connect.fields.len() + 8)
+            .map(|connect| {
+                connect.fields.len()
+                    + 8
+                    + usize::from(
+                        connect
+                            .signin
+                            .as_ref()
+                            .is_some_and(|signin| !signin.waiting),
+                    )
+            })
             .unwrap_or(8),
         Step::Done => wizard.total() + 8,
     };
@@ -871,6 +1116,14 @@ pub fn keys(wizard: &Wizard) -> Vec<(String, String)> {
         ],
         Step::Connect => {
             let connect = wizard.connect.as_ref();
+            if let Some(signin) = connect.and_then(|connect| connect.signin.as_ref()) {
+                let mut keys = vec![pair("esc", "stop waiting")];
+                if !signin.waiting {
+                    keys.insert(0, pair("enter", "use the code"));
+                    keys.push(pair("ctrl+r", "reveal"));
+                }
+                return keys;
+            }
             let mut keys = vec![pair("↑↓", "field"), pair("ctrl+r", "reveal")];
             if connect.is_some_and(|connect| connect.verified.is_some()) {
                 keys.push(pair("enter", "save this account"));
@@ -879,6 +1132,9 @@ pub fn keys(wizard: &Wizard) -> Vec<(String, String)> {
                 keys.push(pair("type", "fix"));
             } else {
                 keys.push(pair("enter", "check"));
+            }
+            if connect.is_some_and(|connect| providers::oauth_spec(connect.provider).is_some()) {
+                keys.push(pair("o", "sign in with a browser"));
             }
             keys.push(pair("esc", "back"));
             keys
@@ -1038,8 +1294,10 @@ fn connect_lines(
     ]));
     lines.push(Line::from(""));
     let field_width = inner.width.saturating_sub(20).max(10) as usize;
+    // A sign-in puts the code it needs under the form, where the form's own fields end.
+    let signing_in = connect.signin.as_ref().filter(|signin| !signin.waiting);
     for (index, field) in connect.fields.iter().enumerate() {
-        let focused = index == connect.focus;
+        let focused = index == connect.focus && connect.signin.is_none();
         let (shown, column) = field.input.display(field_width);
         let y = inner.y + lines.len() as u16;
         lines.push(Line::from(vec![
@@ -1064,17 +1322,40 @@ fn connect_lines(
             *cursor = Some((inner.x + 20 + column as u16, y));
         }
     }
+    if let Some(signin) = signing_in {
+        let (shown, column) = signin.code.display(field_width);
+        let y = inner.y + lines.len() as u16;
+        lines.push(Line::from(vec![
+            Span::styled(" ▸ ", Style::default().fg(ACCENT)),
+            Span::styled(ui::pad("Sign-in code", 17), Style::default().fg(TEXT)),
+            Span::styled(
+                if shown.is_empty() {
+                    "…".into()
+                } else {
+                    ui::clip(&shown, field_width)
+                },
+                Style::default().fg(TEXT),
+            ),
+        ]));
+        *cursor = Some((inner.x + 20 + column as u16, y));
+    }
     lines.push(Line::from(""));
-    let status = match (&connect.verified, &connect.error) {
-        (Some(summary), _) => Line::from(Span::styled(
+    let status = match (&connect.signin, &connect.verified, &connect.error) {
+        (Some(signin), _, _) => Line::from(Span::styled(
+            format!("◌ {}", signin.status()),
+            Style::default().fg(ACCENT),
+        )),
+        (None, Some(summary), _) => Line::from(Span::styled(
             format!("✓ {summary}"),
             Style::default().fg(Color::Rgb(0x5E, 0xB8, 0x8A)),
         )),
-        (None, Some(why)) => Line::from(Span::styled(
+        (None, None, Some(why)) => Line::from(Span::styled(
             format!("✗ {why}"),
             Style::default().fg(Color::Rgb(0xC9, 0x7B, 0x7B)),
         )),
-        (None, None) => Line::from(Span::styled("not checked yet", Style::default().fg(FAINT))),
+        (None, None, None) => {
+            Line::from(Span::styled("not checked yet", Style::default().fg(FAINT)))
+        }
     };
     lines.push(status);
 }
@@ -1406,6 +1687,7 @@ mod tests {
                 access_token: "at".into(),
                 account_id: None,
                 refresh_token: None,
+                expires_at: 0,
             },
             origin: None,
             summary: "checked".into(),
@@ -1452,6 +1734,152 @@ mod tests {
         assert!(!text.contains("Local config"), "{text}");
         // And the connect form is what the bottom bar is describing.
         assert!(keys(&wizard).contains(&("enter".to_string(), "check".to_string())));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two providers that can sign in by browser say so; the rest offer no dead key.
+    #[test]
+    fn only_the_signing_providers_offer_a_browser() {
+        for provider in ProviderId::ALL {
+            let mut wizard = Wizard::new_add(SortMode::Manual);
+            wizard.step = Step::Connect;
+            wizard.connect = Some(Connect::new(provider));
+            let guide = keys(&wizard);
+            let offered = guide
+                .iter()
+                .any(|(key, action)| key == "o" && action == "sign in with a browser");
+            let expected = matches!(provider, ProviderId::Codex | ProviderId::Claude);
+            assert_eq!(offered, expected, "{} offered {}", provider.slug(), offered);
+        }
+    }
+
+    /// Signing in does not go through the field check: the credential that comes back is
+    /// the one that gets saved, with no file behind it.
+    #[test]
+    fn a_signed_in_credential_is_what_gets_saved() {
+        let dir = scratch("signed-in");
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        let mut connect = Connect::new(ProviderId::Claude);
+        connect.signed_in = Some(Credential::ClaudeOauth {
+            access_token: "oat".into(),
+            refresh_token: "ort".into(),
+            expires_at: 4_000_000_000_000,
+            subscription_type: Some("max".into()),
+        });
+        connect.verified = Some("signed in as a@b.c · max".into());
+        set(&mut connect, Role::Name, "work");
+        wizard.connect = Some(connect);
+
+        assert!(matches!(save_connect(&mut wizard, &mut app), Action::Keep));
+        let pending = &wizard.pending[0];
+        assert_eq!(pending.account.id, "claude");
+        assert_eq!(pending.account.label.as_deref(), Some("work"));
+        assert!(
+            pending.origin.is_none(),
+            "a sign-in has no file to point at"
+        );
+        assert_eq!(
+            pending.credential,
+            Credential::ClaudeOauth {
+                access_token: "oat".into(),
+                refresh_token: "ort".into(),
+                expires_at: 4_000_000_000_000,
+                subscription_type: Some("max".into()),
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Typing over a credential after signing in drops the signed-in pair, so what is
+    /// saved is what the form shows.
+    #[test]
+    fn editing_a_credential_field_forgets_the_sign_in() {
+        let dir = scratch("signin-edit");
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        let mut connect = Connect::new(ProviderId::Claude);
+        connect.signed_in = Some(Credential::ClaudeOauth {
+            access_token: "oat".into(),
+            refresh_token: "ort".into(),
+            expires_at: 0,
+            subscription_type: None,
+        });
+        connect.focus = connect
+            .fields
+            .iter()
+            .position(|field| field.role == Role::Access)
+            .unwrap();
+        wizard.connect = Some(connect);
+        wizard.step = Step::Connect;
+
+        press(&mut wizard, &mut app, KeyCode::Char('x'));
+        assert!(wizard.connect.as_ref().unwrap().signed_in.is_none());
+        // And the form is back to being the source of the credential.
+        assert!(matches!(save_connect(&mut wizard, &mut app), Action::Keep));
+        assert!(wizard.pending.is_empty(), "an unfinished pair is not saved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The code a browser shows is carried back by hand for Claude, and a pasted
+    /// "code#state" is split the way the vendor's own CLI splits it.
+    #[test]
+    fn a_pasted_code_is_split_at_the_hash() {
+        assert_eq!(pasted_code("abc-123#state-from-the-page"), "abc-123");
+        assert_eq!(pasted_code("  abc-123  "), "abc-123");
+        assert_eq!(pasted_code(""), "");
+        assert_eq!(pasted_code("#only-state"), "");
+    }
+
+    /// While a sign-in is open the screen says what it is waiting for, offers the field
+    /// the browser's code goes in, and takes the keys for itself.
+    #[test]
+    fn a_sign_in_in_flight_is_what_the_screen_shows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = scratch("signin-draw");
+        let app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        wizard.step = Step::Connect;
+        let mut connect = Connect::new(ProviderId::Claude);
+        connect.signin = Some(SignIn {
+            inner: crate::oauth::SignIn::start(providers::oauth_spec(ProviderId::Claude).unwrap())
+                .unwrap(),
+            code: TextInput::new(),
+            waiting: false,
+            rx: None,
+        });
+        wizard.connect = Some(connect);
+        let mut terminal = Terminal::new(TestBackend::new(96, 26)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &wizard, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Sign-in code"), "{text}");
+        assert!(text.contains("approve in the browser"), "{text}");
+        // The guide is the sign-in's, not the form's.
+        let guide = keys(&wizard);
+        assert!(guide.contains(&("esc".to_string(), "stop waiting".to_string())));
+        assert!(guide.contains(&("enter".to_string(), "use the code".to_string())));
+        // Typing goes to the code, not to the form underneath it.
+        let mut wizard = wizard;
+        let mut app = app;
+        press(&mut wizard, &mut app, KeyCode::Char('c'));
+        let signin = wizard.connect.as_ref().unwrap().signin.as_ref().unwrap();
+        assert_eq!(signin.code.value(), "c");
+        // And one esc leaves the form as it was, with nothing signed in.
+        press(&mut wizard, &mut app, KeyCode::Esc);
+        let connect = wizard.connect.as_ref().unwrap();
+        assert!(connect.signin.is_none());
+        assert!(connect.signed_in.is_none());
+        assert_eq!(wizard.step, Step::Connect);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
