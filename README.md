@@ -43,9 +43,9 @@ and the same name field as every other account.
 
 ### Signing in with a browser
 
-Claude and Codex also have a sign-in, on `o` from their connect screens, for an account that
-is not signed in on this machine at all. It uses the same client each vendor's own CLI uses,
-and the same flow:
+Claude and Codex also have a sign-in, on the "sign in with a browser" row at the top of
+their connect screens, for an account that is not signed in on this machine at all. It uses
+the same client each vendor's own CLI uses, and the same flow:
 
 - **Codex** serves the browser's callback on `localhost:1455`, so the credential arrives on
   its own; the account id comes out of the id_token and is sent with every usage call.

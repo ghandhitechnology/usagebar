@@ -96,6 +96,9 @@ impl SignIn {
 /// makes its form shorter than the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    /// Not a field at all: the row that starts the browser sign-in, for the providers
+    /// that have one.
+    SignIn,
     /// A vendor file to import from, for the providers that keep one.
     Config,
     Access,
@@ -403,9 +406,6 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
             wizard.connect = None;
             wizard.note = None;
         }
-        KeyCode::Char('o') if providers::oauth_spec(connect.provider).is_some() => {
-            return start_signin(wizard);
-        }
         KeyCode::Up => {
             connect.focus = connect.focus.saturating_sub(1);
         }
@@ -413,6 +413,15 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
             connect.focus = (connect.focus + 1).min(connect.fields.len() - 1);
         }
         KeyCode::Enter => {
+            // The sign-in row is the one row on the form that answers enter with an
+            // action rather than a check.
+            if connect
+                .fields
+                .get(connect.focus)
+                .is_some_and(|field| field.role == Role::SignIn)
+            {
+                return start_signin(wizard);
+            }
             if connect.verified.is_some() || connect.error.is_some() {
                 // A failed check still allows saving: the vendor may be rate limiting
                 // or down, and the panel will keep showing why until it recovers.
@@ -421,16 +430,22 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
             return check(wizard);
         }
         _ => {
-            if let Some(field) = connect.fields.get_mut(connect.focus) {
-                if field.input.handle_key(key) {
-                    // Typing in the name does not invalidate the check; changing a
-                    // credential does, and a credential that came from a sign-in too.
-                    if connect.focus + 1 < connect.fields.len() {
-                        connect.verified = None;
-                        connect.signed_in = None;
-                    }
-                    connect.error = None;
+            let Some(field) = connect.fields.get_mut(connect.focus) else {
+                return Action::Keep;
+            };
+            // The sign-in row holds nothing to type into, like the setting rows that are
+            // not fields: it answers to the arrow keys and to enter, and to nothing else.
+            if field.role == Role::SignIn {
+                return Action::Keep;
+            }
+            if field.input.handle_key(key) {
+                // Typing in the name does not invalidate the check; changing a
+                // credential does, and a credential that came from a sign-in too.
+                if field.role != Role::Name {
+                    connect.verified = None;
+                    connect.signed_in = None;
                 }
+                connect.error = None;
             }
         }
     }
@@ -870,6 +885,12 @@ fn find_existing(
 impl Connect {
     pub fn new(provider: ProviderId) -> Self {
         let mut fields = Vec::new();
+        // A sign-in comes first on the screen, since it is the one way in that does not
+        // need anything on this machine — but the focus starts on the first real field,
+        // so enter still means "read what is already here".
+        if providers::oauth_spec(provider).is_some() {
+            fields.push(Field::new(Role::SignIn, "Sign in", TextInput::new()));
+        }
         if let Some(path) = credentials::vendor_file(provider) {
             // Prefilled when the file is there; a path that is not stays an empty field.
             let path = if path.exists() {
@@ -918,10 +939,15 @@ impl Connect {
             }
         }
         fields.push(Field::new(Role::Name, "Name", TextInput::new()));
+        // The focus opens on the first field that holds something a user can type into.
+        let focus = fields
+            .iter()
+            .position(|field| field.role != Role::SignIn)
+            .unwrap_or(0);
         Self {
             provider,
             fields,
-            focus: 0,
+            focus,
             verified: None,
             error: None,
             signin: None,
@@ -1125,16 +1151,20 @@ pub fn keys(wizard: &Wizard) -> Vec<(String, String)> {
                 return keys;
             }
             let mut keys = vec![pair("↑↓", "field"), pair("ctrl+r", "reveal")];
-            if connect.is_some_and(|connect| connect.verified.is_some()) {
+            if connect.is_some_and(|connect| {
+                connect
+                    .fields
+                    .get(connect.focus)
+                    .is_some_and(|field| field.role == Role::SignIn)
+            }) {
+                keys.push(pair("enter", "sign in with a browser"));
+            } else if connect.is_some_and(|connect| connect.verified.is_some()) {
                 keys.push(pair("enter", "save this account"));
             } else if connect.is_some_and(|connect| connect.error.is_some()) {
                 keys.push(pair("enter", "save anyway"));
                 keys.push(pair("type", "fix"));
             } else {
                 keys.push(pair("enter", "check"));
-            }
-            if connect.is_some_and(|connect| providers::oauth_spec(connect.provider).is_some()) {
-                keys.push(pair("o", "sign in with a browser"));
             }
             keys.push(pair("esc", "back"));
             keys
@@ -1298,6 +1328,21 @@ fn connect_lines(
     let signing_in = connect.signin.as_ref().filter(|signin| !signin.waiting);
     for (index, field) in connect.fields.iter().enumerate() {
         let focused = index == connect.focus && connect.signin.is_none();
+        // The sign-in row is an action, not a field: it reads like the rows that add
+        // things rather than the ones that hold something.
+        if field.role == Role::SignIn {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if focused { " ▸ " } else { "   " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    "+ sign in with a browser…",
+                    Style::default().fg(if focused { ACCENT } else { DIM }),
+                ),
+            ]));
+            continue;
+        }
         let (shown, column) = field.input.display(field_width);
         let y = inner.y + lines.len() as u16;
         lines.push(Line::from(vec![
@@ -1737,19 +1782,84 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The two providers that can sign in by browser say so; the rest offer no dead key.
+    /// The guide follows the row the focus is on: the sign-in row answers enter with a
+    /// sign-in, and a field answers it with a check.
     #[test]
-    fn only_the_signing_providers_offer_a_browser() {
+    fn the_guide_follows_the_focused_row() {
+        let dir = scratch("signin-guide");
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        wizard.step = Step::Connect;
+        let mut connect = Connect::new(ProviderId::Codex);
+        connect.focus = connect
+            .fields
+            .iter()
+            .position(|field| field.role == Role::SignIn)
+            .unwrap();
+        wizard.connect = Some(connect);
+        assert!(
+            keys(&wizard).contains(&("enter".to_string(), "sign in with a browser".to_string()))
+        );
+
+        press(&mut wizard, &mut app, KeyCode::Down);
+        let connect = wizard.connect.as_ref().unwrap();
+        assert_eq!(connect.fields[connect.focus].role, Role::Config);
+        let guide = keys(&wizard);
+        assert!(guide.contains(&("enter".to_string(), "check".to_string())));
+        assert!(!guide.iter().any(|(key, _)| key == "o"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The sign-in is a row of the form, not only a key in the guide: at 60 columns the
+    /// guide has already dropped entries, and an option that disappears with the width
+    /// is an option nobody finds.
+    #[test]
+    fn the_sign_in_row_is_on_the_form_whatever_the_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
         for provider in ProviderId::ALL {
+            let dir = scratch(&format!("signin-row-{}", provider.slug()));
+            let app = app_with(&dir);
             let mut wizard = Wizard::new_add(SortMode::Manual);
             wizard.step = Step::Connect;
-            wizard.connect = Some(Connect::new(provider));
-            let guide = keys(&wizard);
-            let offered = guide
+            let connect = Connect::new(provider);
+            let row = connect
+                .fields
                 .iter()
-                .any(|(key, action)| key == "o" && action == "sign in with a browser");
-            let expected = matches!(provider, ProviderId::Codex | ProviderId::Claude);
-            assert_eq!(offered, expected, "{} offered {}", provider.slug(), offered);
+                .position(|field| field.role == Role::SignIn);
+            assert_eq!(
+                row.is_some(),
+                matches!(provider, ProviderId::Codex | ProviderId::Claude),
+                "{} rows",
+                provider.slug()
+            );
+            if row.is_some() {
+                // It leads the screen, and the focus starts past it on something typable.
+                assert_eq!(row, Some(0));
+                assert_ne!(connect.focus, 0);
+                assert_ne!(connect.fields[connect.focus].role, Role::SignIn);
+            }
+            wizard.connect = Some(connect);
+
+            let mut terminal = Terminal::new(TestBackend::new(60, 26)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &app, &wizard, frame.area()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+                .collect();
+            assert_eq!(
+                text.contains("sign in with a browser"),
+                row.is_some(),
+                "{} drew: {text}",
+                provider.slug()
+            );
+            std::fs::remove_dir_all(&dir).ok();
         }
     }
 
