@@ -1,6 +1,7 @@
 //! Rendering. A dense panel grid with vendor-accurate numbers, tuned for a dark terminal.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -10,21 +11,33 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
 
-use crate::model::{Health, Report};
+use crate::config::SortMode;
+use crate::credentials::CredentialStore;
+use crate::model::{AccountRef, Health, ProviderId, Report};
 
 pub struct App {
     pub reports: Vec<Report>,
-    /// Observed samples per (provider, window). These are our own readings of vendor
+    /// Observed samples per account and window. These are our own readings of vendor
     /// numbers, so the sparkline never invents history.
     pub history: HashMap<(String, String), VecDeque<f64>>,
     pub last_refresh: Option<Instant>,
     pub refreshing: bool,
     pub paused: bool,
     pub interval_secs: u64,
+    /// Accounts in display order, and the secrets they read from.
+    pub accounts: Vec<AccountRef>,
+    pub store: Arc<dyn CredentialStore>,
+    pub sort: SortMode,
+    /// Anything the user should hear about at startup, e.g. an unreadable config.
+    pub boot_note: Option<String>,
+    pub overlay: Option<Overlay>,
 }
 
+/// The modal screens. One at a time; the base view owns every key when this is None.
+pub enum Overlay {}
+
 impl App {
-    pub fn new(interval_secs: u64) -> Self {
+    pub fn new(interval_secs: u64, store: Arc<dyn CredentialStore>, sort: SortMode) -> Self {
         Self {
             reports: Vec::new(),
             history: HashMap::new(),
@@ -32,19 +45,19 @@ impl App {
             refreshing: false,
             paused: false,
             interval_secs,
+            accounts: Vec::new(),
+            store,
+            sort,
+            boot_note: None,
+            overlay: None,
         }
     }
 
     pub fn absorb(&mut self, reports: Vec<Report>) {
-        let previous: HashMap<(String, Option<String>), Report> = self
+        let previous: HashMap<String, Report> = self
             .reports
             .iter()
-            .map(|report| {
-                (
-                    (report.provider.to_string(), report.account.clone()),
-                    report.clone(),
-                )
-            })
+            .map(|report| (report.key.clone(), report.clone()))
             .collect();
         let last_good = self.last_refresh.unwrap_or_else(Instant::now);
 
@@ -55,9 +68,10 @@ impl App {
                 // vendor number a moment ago; keep the number and say how old it is.
                 if report.windows.is_empty() {
                     if let Health::Unavailable(why) = &report.health {
-                        let key = (report.provider.to_string(), report.account.clone());
-                        if let Some(last) = previous.get(&key).filter(|r| !r.windows.is_empty()) {
+                        if let Some(last) = previous.get(&report.key).filter(|r| !r.windows.is_empty())
+                        {
                             report.windows = last.windows.clone();
+                            report.facts = last.facts.clone();
                             report.notes = last.notes.clone();
                             report.plan = report.plan.or_else(|| last.plan.clone());
                             report.health = Health::Stale {
@@ -75,7 +89,7 @@ impl App {
             for window in &report.windows {
                 let slot = self
                     .history
-                    .entry((report.provider.to_string(), window.label.clone()))
+                    .entry((report.key.clone(), window.label.clone()))
                     .or_default();
                 slot.push_back(window.used_percent);
                 while slot.len() > 64 {
@@ -90,9 +104,14 @@ impl App {
 
     fn samples(&self, report: &Report, label: &str) -> Vec<f64> {
         self.history
-            .get(&(report.provider.to_string(), label.to_string()))
+            .get(&(report.key.clone(), label.to_string()))
             .map(|slot| slot.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// The report for an account id, in display order.
+    pub fn report_for(&self, key: &str) -> Option<&Report> {
+        self.reports.iter().find(|report| report.key == key)
     }
 }
 
@@ -104,16 +123,15 @@ const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
 const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
 const TRACK: Color = Color::Rgb(0x33, 0x36, 0x3D);
 
-fn provider_color(name: &str) -> Color {
-    match name {
-        "Claude" => Color::Rgb(0xD9, 0x77, 0x57),
-        "Codex" => Color::Rgb(0x4F, 0xB8, 0x9A),
-        "OpenCode Go" => Color::Rgb(0x7A, 0xA2, 0xF7),
-        "Cursor" => Color::Rgb(0xB9, 0xC2, 0xD6),
-        "Grok" => Color::Rgb(0x9C, 0xA3, 0xAF),
-        "Devin" => Color::Rgb(0x6E, 0x9E, 0xE8),
-        "Command Code" => Color::Rgb(0xE0, 0xA8, 0x5E),
-        _ => DIM,
+fn provider_color(provider: ProviderId) -> Color {
+    match provider {
+        ProviderId::Claude => Color::Rgb(0xD9, 0x77, 0x57),
+        ProviderId::Codex => Color::Rgb(0x4F, 0xB8, 0x9A),
+        ProviderId::OpenCodeGo => Color::Rgb(0x7A, 0xA2, 0xF7),
+        ProviderId::Cursor => Color::Rgb(0xB9, 0xC2, 0xD6),
+        ProviderId::Grok => Color::Rgb(0x9C, 0xA3, 0xAF),
+        ProviderId::Devin => Color::Rgb(0x6E, 0x9E, 0xE8),
+        ProviderId::CommandCode => Color::Rgb(0xE0, 0xA8, 0x5E),
     }
 }
 
@@ -465,7 +483,8 @@ fn card_height(report: &Report, density: Density) -> u16 {
         Health::Unavailable(_) => 2,
         Health::Stale { .. } => report.windows.len() * per_window + 1,
         Health::Ok | Health::NoQuota(_) => {
-            report.windows.len() * per_window + usize::from(!report.notes.is_empty())
+            report.windows.len() * per_window
+                + usize::from(!report.notes.is_empty() || report.facts.iter().any(|f| f.panel))
         }
     };
     (content + 2) as u16
@@ -487,7 +506,7 @@ fn row_line(frame: &mut Frame, app: &App, report: &Report, area: Rect) {
     });
 
     let mut spans = vec![Span::styled(
-        pad(report.provider, name_width),
+        pad(report.provider.display(), name_width),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
 
@@ -547,12 +566,16 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Dens
     let healthy = matches!(report.health, Health::Ok | Health::Stale { .. });
 
     let mut title = vec![Span::styled(
-        format!(" {} ", report.provider),
+        format!(" {} ", report.provider.display()),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
-    if let Some(account) = &report.account {
+    if let Some(name) = report
+        .label
+        .clone()
+        .or_else(|| report.account.clone())
+    {
         title.push(Span::styled(
-            format!("{} ", crate::model::short_account(account)),
+            format!("{} ", crate::model::short_account(&name)),
             Style::default().fg(FAINT),
         ));
     }
@@ -710,9 +733,16 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Dens
         ]));
     }
 
-    if !report.notes.is_empty() {
+    if !report.notes.is_empty() || report.facts.iter().any(|fact| fact.panel) {
+        let mut summary: Vec<String> = report
+            .facts
+            .iter()
+            .filter(|fact| fact.panel)
+            .map(|fact| format!("{} {}", fact.label, fact.value))
+            .collect();
+        summary.extend(report.notes.iter().cloned());
         lines.push(Line::from(Span::styled(
-            clip(&report.notes.join(" · "), width),
+            clip(&summary.join(" · "), width),
             Style::default().fg(FAINT),
         )));
     }
@@ -723,19 +753,24 @@ fn card(frame: &mut Frame, app: &App, report: &Report, area: Rect, density: Dens
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::MemoryStore;
     use crate::model::Window;
     use chrono::TimeZone;
+
+    fn test_app() -> App {
+        App::new(60, Arc::new(MemoryStore::new()), SortMode::Manual)
+    }
 
     /// A failed poll must keep the previous vendor number, marked stale, rather than
     /// blanking a panel that was reporting fine a minute ago.
     #[test]
     fn failure_keeps_last_good_reading() {
-        let mut app = App::new(60);
-        let mut good = Report::new("Claude");
+        let mut app = test_app();
+        let mut good = Report::new(ProviderId::Claude).key("claude");
         good.windows.push(Window::new("Weekly", 42.0));
         app.absorb(vec![good]);
 
-        app.absorb(vec![Report::failed("Claude", "HTTP 429".into())]);
+        app.absorb(vec![Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")]);
 
         let report = &app.reports[0];
         assert_eq!(report.windows.len(), 1);
@@ -746,11 +781,25 @@ mod tests {
         }
     }
 
+    /// Two accounts of one provider are two panels; history must not mix them.
+    #[test]
+    fn accounts_of_one_provider_keep_separate_histories() {
+        let mut app = test_app();
+        let mut first = Report::new(ProviderId::Claude).key("claude-a");
+        first.windows.push(Window::new("Weekly", 10.0));
+        let mut second = Report::new(ProviderId::Claude).key("claude-b");
+        second.windows.push(Window::new("Weekly", 80.0));
+        app.absorb(vec![first, second]);
+
+        assert_eq!(app.samples(&app.reports[0], "Weekly"), vec![10.0]);
+        assert_eq!(app.samples(&app.reports[1], "Weekly"), vec![80.0]);
+    }
+
     /// Without a previous reading there is nothing honest to show, so the error stands.
     #[test]
     fn failure_without_history_stays_unavailable() {
-        let mut app = App::new(60);
-        app.absorb(vec![Report::failed("Claude", "HTTP 429".into())]);
+        let mut app = test_app();
+        app.absorb(vec![Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")]);
         assert!(matches!(app.reports[0].health, Health::Unavailable(_)));
         assert!(app.reports[0].windows.is_empty());
     }
@@ -774,7 +823,7 @@ mod tests {
         assert_eq!(filled, 5);
     }
 
-    fn sample_report(provider: &'static str, windows: usize) -> Report {
+    fn sample_report(provider: ProviderId, windows: usize) -> Report {
         let mut report = Report::new(provider);
         for index in 0..windows {
             report.windows.push(Window::new(format!("W{index}"), 10.0));
@@ -786,9 +835,9 @@ mod tests {
     /// down: it drops to a lighter drawing or holds panels back, visibly.
     #[test]
     fn plan_falls_back_to_a_density_that_fits() {
-        let reports: Vec<Report> = ["A", "B", "C"]
+        let reports: Vec<Report> = ProviderId::ALL[..3]
             .iter()
-            .map(|p| sample_report(p, 3))
+            .map(|p| sample_report(*p, 3))
             .collect();
         let rows: Vec<&[Report]> = reports.chunks(1).collect();
 
@@ -813,9 +862,9 @@ mod tests {
 
     #[test]
     fn plan_reports_panels_it_could_not_fit() {
-        let reports: Vec<Report> = ["A", "B", "C", "D"]
+        let reports: Vec<Report> = ProviderId::ALL[..4]
             .iter()
-            .map(|p| sample_report(p, 3))
+            .map(|p| sample_report(*p, 3))
             .collect();
         let rows: Vec<&[Report]> = reports.chunks(1).collect();
 
