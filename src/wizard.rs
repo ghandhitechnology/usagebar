@@ -593,7 +593,7 @@ impl Connect {
             .filter(|path| path.exists())
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        let mut fields = vec![Field::new("Credentials file", TextInput::with_value(path))];
+        let mut fields = vec![Field::new("Local config", TextInput::with_value(path))];
         match provider {
             ProviderId::Claude => {
                 fields.push(Field::new("Access token", TextInput::new().secret()));
