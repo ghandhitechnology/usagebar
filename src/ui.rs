@@ -1,16 +1,23 @@
 //! Rendering. A dense panel grid with vendor-accurate numbers, tuned for a dark terminal.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
 
-use crate::model::{Health, Report};
+use crate::config::{self, Config, SortMode};
+use crate::credentials::{CredentialStore, FileStore, MemoryStore};
+use crate::model::{AccountRef, Health, ProviderId, Report};
+use crate::settings::{self, Settings};
+use crate::wizard::{self, Wizard};
 
 pub struct App {
     pub reports: Vec<Report>,
@@ -18,42 +25,186 @@ pub struct App {
     pub refreshing: bool,
     pub paused: bool,
     pub interval_secs: u64,
+    /// True when --interval named a value for this run only; finishing setup must not
+    /// turn that into the saved preference.
+    pub interval_locked: bool,
+    /// Accounts in display order, and the secrets they read from.
+    pub accounts: Vec<AccountRef>,
+    pub store: Arc<dyn CredentialStore>,
+    /// The saved preferences. `accounts` mirrors this list whenever a config exists.
+    pub config: Config,
+    pub config_path: PathBuf,
+    /// False until a config has been written; onboarding starts when it never was.
+    pub persisted: bool,
+    /// Always the on-disk credential store; writes go here.
+    pub file_store: Arc<FileStore>,
+    /// Credentials found by the startup scan but not yet committed to the store.
+    pub detected_store: Option<Arc<MemoryStore>>,
+    /// Anything the user should hear about at startup, e.g. an unreadable config.
+    pub boot_note: Option<String>,
+    pub overlay: Option<Overlay>,
+}
+
+/// The modal screens. One at a time; the base view owns every key when this is None.
+pub enum Overlay {
+    Settings(Settings),
+    Wizard(Wizard),
+    Detail(crate::detail::Detail),
+}
+
+impl Overlay {
+    pub fn handle(&mut self, app: &mut App, key: KeyEvent) -> OverlayAction {
+        match self {
+            Overlay::Settings(settings) => match settings::handle(settings, app, key) {
+                settings::Action::Keep => OverlayAction::Keep,
+                settings::Action::Close => OverlayAction::Close,
+                settings::Action::Refresh => OverlayAction::Refresh,
+                settings::Action::OpenWizard => OverlayAction::OpenWizard,
+            },
+            Overlay::Wizard(wizard) => match wizard::handle(wizard, app, key) {
+                wizard::Action::Keep => OverlayAction::Keep,
+                wizard::Action::Close => OverlayAction::Close,
+                wizard::Action::Saved => OverlayAction::Saved,
+            },
+            Overlay::Detail(detail) => match crate::detail::handle(detail, app, key) {
+                crate::detail::Action::Keep => OverlayAction::Keep,
+                crate::detail::Action::Close => OverlayAction::Close,
+            },
+        }
+    }
+
+    /// A paste goes to whatever field is focused in the open overlay.
+    pub fn paste(&mut self, text: &str) {
+        match self {
+            Overlay::Settings(settings) => {
+                if let Some(input) = settings.editing.as_mut() {
+                    input.paste(text);
+                }
+            }
+            Overlay::Wizard(wizard) => wizard.paste(text),
+            Overlay::Detail(_) => {}
+        }
+    }
+
+    /// Called every tick so background work can land without blocking the UI.
+    pub fn poll(&mut self) {
+        if let Overlay::Wizard(wizard) = self {
+            wizard.poll();
+        }
+    }
+}
+
+pub enum OverlayAction {
+    Keep,
+    Close,
+    /// Keep the overlay open, but re-read every account.
+    Refresh,
+    /// The overlay is done and closed; re-read every account.
+    Saved,
+    OpenWizard,
 }
 
 impl App {
-    pub fn new(interval_secs: u64) -> Self {
+    pub fn new(
+        interval_secs: u64,
+        store: Arc<dyn CredentialStore>,
+        sort: SortMode,
+        file_store: Arc<FileStore>,
+    ) -> Self {
         Self {
             reports: Vec::new(),
             last_refresh: None,
             refreshing: false,
             paused: false,
             interval_secs,
+            interval_locked: false,
+            accounts: Vec::new(),
+            store,
+            config: Config {
+                interval_secs,
+                sort,
+                ..Config::default()
+            },
+            config_path: config::config_path(&config::dir()),
+            persisted: false,
+            file_store,
+            detected_store: None,
+            boot_note: None,
+            overlay: None,
+        }
+    }
+
+    /// Write the preferences. Returns the error for the overlay to show, if any.
+    pub fn save_config(&mut self) -> Option<String> {
+        match config::save(&self.config_path, &self.config) {
+            Ok(()) => {
+                self.persisted = true;
+                None
+            }
+            Err(why) => Some(why),
+        }
+    }
+
+    /// The user changed which accounts are shown or their order. Accounts that only
+    /// existed as a scan result are committed to the credential store here, because an
+    /// account the user kept has to survive a restart.
+    pub fn save_accounts(&mut self, accounts: Vec<AccountRef>) -> Option<String> {
+        self.accounts = accounts;
+        self.config.accounts = self.accounts.clone();
+        // Once the list is the user's, stop scanning for new credentials each run.
+        self.config.detect = Some(false);
+        for account in &self.accounts {
+            if self.file_store.get(&account.id).is_none() {
+                if let Some(stored) = self
+                    .detected_store
+                    .as_ref()
+                    .and_then(|store| store.get(&account.id))
+                {
+                    if let Err(why) = self.file_store.put(&account.id, stored) {
+                        return Some(why);
+                    }
+                }
+            }
+        }
+        self.store = Arc::clone(&self.file_store) as Arc<dyn CredentialStore>;
+        self.save_config()
+    }
+
+    pub fn forget_credentials(&self, account_id: &str) {
+        if let Err(why) = self.file_store.remove(account_id) {
+            eprintln!("usagebar: could not remove credentials for {account_id}: {why}");
         }
     }
 
     pub fn absorb(&mut self, reports: Vec<Report>) {
-        let previous: HashMap<(String, Option<String>), Report> = self
+        let previous: HashMap<String, Report> = self
             .reports
             .iter()
-            .map(|report| {
-                (
-                    (report.provider.to_string(), report.account.clone()),
-                    report.clone(),
-                )
-            })
+            .map(|report| (report.key.clone(), report.clone()))
             .collect();
         let last_good = self.last_refresh.unwrap_or_else(Instant::now);
+        // A fetch started before the account list changed can still be in flight; its
+        // readings are for accounts the user just hid or removed.
+        let expected: Vec<&str> = self
+            .accounts
+            .iter()
+            .filter(|account| !account.hidden)
+            .map(|account| account.id.as_str())
+            .collect();
 
         let reports: Vec<Report> = reports
             .into_iter()
+            .filter(|report| expected.contains(&report.key.as_str()))
             .map(|mut report| {
                 // A rate limit or a network blip should not erase a panel that had a real
                 // vendor number a moment ago; keep the number and say how old it is.
                 if report.windows.is_empty() {
                     if let Health::Unavailable(why) = &report.health {
-                        let key = (report.provider.to_string(), report.account.clone());
-                        if let Some(last) = previous.get(&key).filter(|r| !r.windows.is_empty()) {
+                        if let Some(last) =
+                            previous.get(&report.key).filter(|r| !r.windows.is_empty())
+                        {
                             report.windows = last.windows.clone();
+                            report.facts = last.facts.clone();
                             report.notes = last.notes.clone();
                             report.plan = report.plan.or_else(|| last.plan.clone());
                             report.health = Health::Stale {
@@ -71,31 +222,35 @@ impl App {
         self.last_refresh = Some(Instant::now());
         self.refreshing = false;
     }
+
+    /// The report for an account id, in display order.
+    pub fn report_for(&self, key: &str) -> Option<&Report> {
+        self.reports.iter().find(|report| report.key == key)
+    }
 }
 
 // ------------------------------------------------------------------ palette
 
-const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
-const DIM: Color = Color::Rgb(0x6B, 0x6F, 0x7A);
-const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
-const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
+pub(crate) const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
+pub(crate) const DIM: Color = Color::Rgb(0x6B, 0x6F, 0x7A);
+pub(crate) const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
+pub(crate) const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
 const TRACK: Color = Color::Rgb(0x33, 0x36, 0x3D);
 
-fn provider_color(name: &str) -> Color {
-    match name {
-        "Claude" => Color::Rgb(0xD9, 0x77, 0x57),
-        "Codex" => Color::Rgb(0x4F, 0xB8, 0x9A),
-        "OpenCode Go" => Color::Rgb(0x7A, 0xA2, 0xF7),
-        "Cursor" => Color::Rgb(0xB9, 0xC2, 0xD6),
-        "Grok" => Color::Rgb(0x9C, 0xA3, 0xAF),
-        "Devin" => Color::Rgb(0x6E, 0x9E, 0xE8),
-        "Command Code" => Color::Rgb(0xE0, 0xA8, 0x5E),
-        _ => DIM,
+pub(crate) fn provider_color(provider: ProviderId) -> Color {
+    match provider {
+        ProviderId::Claude => Color::Rgb(0xD9, 0x77, 0x57),
+        ProviderId::Codex => Color::Rgb(0x4F, 0xB8, 0x9A),
+        ProviderId::OpenCodeGo => Color::Rgb(0x7A, 0xA2, 0xF7),
+        ProviderId::Cursor => Color::Rgb(0xB9, 0xC2, 0xD6),
+        ProviderId::Grok => Color::Rgb(0x9C, 0xA3, 0xAF),
+        ProviderId::Devin => Color::Rgb(0x6E, 0x9E, 0xE8),
+        ProviderId::CommandCode => Color::Rgb(0xE0, 0xA8, 0x5E),
     }
 }
 
 /// Filled-bar ramp, cool when there is headroom and hot when there is not.
-fn ramp(percent: f64, position: f64) -> Color {
+pub(crate) fn ramp(percent: f64, position: f64) -> Color {
     let (from, to) = match percent {
         p if p >= 95.0 => ((0xD6, 0x45, 0x45), (0xF2, 0x6B, 0x6B)),
         p if p >= 85.0 => ((0xE0, 0x7A, 0x5F), (0xF2, 0x9E, 0x7E)),
@@ -108,7 +263,7 @@ fn ramp(percent: f64, position: f64) -> Color {
 
 const PARTIALS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
-fn bar_spans(percent: f64, width: usize) -> Vec<Span<'static>> {
+pub(crate) fn bar_spans(percent: f64, width: usize) -> Vec<Span<'static>> {
     let clamped = percent.clamp(0.0, 100.0);
     let exact = clamped / 100.0 * width as f64;
     let full = exact.floor() as usize;
@@ -134,7 +289,7 @@ fn bar_spans(percent: f64, width: usize) -> Vec<Span<'static>> {
     spans
 }
 
-fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
+pub(crate) fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let seconds = (reset - now).num_seconds();
     if seconds <= 0 {
         return "now".into();
@@ -153,7 +308,7 @@ fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-fn clip(text: &str, width: usize) -> String {
+pub(crate) fn clip(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
     }
@@ -165,10 +320,24 @@ fn clip(text: &str, width: usize) -> String {
     out
 }
 
-fn pad(text: &str, width: usize) -> String {
+pub(crate) fn pad(text: &str, width: usize) -> String {
     let clipped = clip(text, width);
     let len = clipped.chars().count();
     format!("{clipped}{}", " ".repeat(width.saturating_sub(len)))
+}
+
+/// A box of a fixed size, centered in the given area. Used by every overlay.
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .flex(ratatui::layout::Flex::Center)
+        .constraints([Constraint::Length(height)])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .flex(ratatui::layout::Flex::Center)
+        .constraints([Constraint::Length(width)])
+        .split(vertical[0])[0]
 }
 
 // ------------------------------------------------------------------ draw
@@ -187,6 +356,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     header(frame, app, chunks[0]);
     grid(frame, app, chunks[1]);
     footer(frame, app, chunks[2]);
+    match &app.overlay {
+        Some(Overlay::Settings(settings)) => settings::draw(frame, app, settings, area),
+        Some(Overlay::Wizard(wizard)) => wizard::draw(frame, app, wizard, area),
+        Some(Overlay::Detail(detail)) => crate::detail::draw(frame, app, detail, area),
+        None => {}
+    }
 }
 
 fn header(frame: &mut Frame, app: &App, area: Rect) {
@@ -264,25 +439,92 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![line, Line::from(second)]), area);
 }
 
+/// The bottom bar: what to press here, for the screen that is open.
 fn footer(frame: &mut Frame, app: &App, area: Rect) {
-    let ok = app
-        .reports
-        .iter()
-        .filter(|r| matches!(r.health, Health::Ok))
-        .count();
-    let keys = Line::from(vec![
-        Span::styled(" q ", Style::default().fg(ACCENT)),
-        Span::styled("quit ", Style::default().fg(DIM)),
-        Span::styled(" r ", Style::default().fg(ACCENT)),
-        Span::styled("refresh now ", Style::default().fg(DIM)),
-        Span::styled(" space ", Style::default().fg(ACCENT)),
-        Span::styled("pause ", Style::default().fg(DIM)),
-        Span::styled(
-            format!(" {ok}/{} reporting", app.reports.len()),
-            Style::default().fg(FAINT),
+    let (guide, tail) = match &app.overlay {
+        None => (
+            vec![
+                ("q".to_string(), "quit".to_string()),
+                ("r".to_string(), "refresh".to_string()),
+                ("space".to_string(), "pause".to_string()),
+                ("s".to_string(), "setup".to_string()),
+                ("d".to_string(), "details".to_string()),
+            ],
+            Some(match &app.boot_note {
+                Some(note) => Span::styled(
+                    format!(" {note}"),
+                    Style::default().fg(Color::Rgb(0xD8, 0xA8, 0x57)),
+                ),
+                None => {
+                    let ok = app
+                        .reports
+                        .iter()
+                        .filter(|r| matches!(r.health, Health::Ok))
+                        .count();
+                    Span::styled(
+                        format!(" {ok}/{} reporting", app.reports.len()),
+                        Style::default().fg(FAINT),
+                    )
+                }
+            }),
         ),
-    ]);
-    frame.render_widget(Paragraph::new(keys), area);
+        Some(Overlay::Settings(_)) => (settings::keys(), None),
+        Some(Overlay::Wizard(wizard)) => (wizard::keys(wizard), None),
+        Some(Overlay::Detail(detail)) => (crate::detail::keys(app, detail), None),
+    };
+
+    let width = area.width as usize;
+    let tail_width = tail.as_ref().map(|span| span.width()).unwrap_or(0);
+    let mut spans = key_guide(&guide, width.saturating_sub(tail_width + 1));
+    if let Some(tail) = tail {
+        let used: usize = spans.iter().map(|span| span.width()).sum();
+        let gap = width.saturating_sub(used + tail.width());
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(tail);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// " q quit · r refresh ", dropping entries that do not fit. A pane too narrow for one
+/// entry still gets the keys themselves, which is the part a newcomer needs.
+fn key_guide(entries: &[(String, String)], width: usize) -> Vec<Span<'static>> {
+    let cost = |index: usize| {
+        let (key, action) = &entries[index];
+        key.chars().count() + action.chars().count() + 2 + if index > 0 { 2 } else { 0 }
+    };
+    let mut budget = 0usize;
+    let mut keep = 0usize;
+    for index in 0..entries.len() {
+        let next = cost(index);
+        if budget + next > width {
+            break;
+        }
+        budget += next;
+        keep += 1;
+    }
+    if keep == 0 {
+        let bare: String = entries
+            .iter()
+            .map(|(key, _)| format!(" {key}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return vec![Span::styled(
+            clip(&bare, width),
+            Style::default().fg(ACCENT),
+        )];
+    }
+    let mut spans = Vec::new();
+    for (index, (key, action)) in entries.iter().take(keep).enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" ·", Style::default().fg(FAINT)));
+        }
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default().fg(ACCENT),
+        ));
+        spans.push(Span::styled(action.clone(), Style::default().fg(DIM)));
+    }
+    spans
 }
 
 /// Cards flow left to right, wrapping into rows; a row is as tall as its tallest card.
@@ -423,12 +665,14 @@ fn card_height(report: &Report, density: Density) -> u16 {
         Density::Full => 2,
         _ => 1,
     };
+    let summary =
+        usize::from(!report.notes.is_empty() || report.facts.iter().any(|fact| fact.panel));
     let content = match &report.health {
         Health::Unavailable(_) => 2,
-        Health::Stale { .. } => report.windows.len() * per_window + 1,
-        Health::Ok | Health::NoQuota(_) => {
-            report.windows.len() * per_window + usize::from(!report.notes.is_empty())
-        }
+        // Stale keeps the windows and the summary from the last good reading and adds
+        // one line saying why it is old.
+        Health::Stale { .. } => report.windows.len() * per_window + 1 + summary,
+        Health::Ok | Health::NoQuota(_) => report.windows.len() * per_window + summary,
     };
     (content + 2) as u16
 }
@@ -449,7 +693,7 @@ fn row_line(frame: &mut Frame, report: &Report, area: Rect) {
     });
 
     let mut spans = vec![Span::styled(
-        pad(report.provider, name_width),
+        pad(report.provider.display(), name_width),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
 
@@ -497,12 +741,12 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
     let healthy = matches!(report.health, Health::Ok | Health::Stale { .. });
 
     let mut title = vec![Span::styled(
-        format!(" {} ", report.provider),
+        format!(" {} ", report.provider.display()),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
-    if let Some(account) = &report.account {
+    if let Some(name) = report.label.clone().or_else(|| report.account.clone()) {
         title.push(Span::styled(
-            format!("{} ", crate::model::short_account(account)),
+            format!("{} ", crate::model::short_account(&name)),
             Style::default().fg(FAINT),
         ));
     }
@@ -645,9 +889,16 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
         ]));
     }
 
-    if !report.notes.is_empty() {
+    if !report.notes.is_empty() || report.facts.iter().any(|fact| fact.panel) {
+        let mut summary: Vec<String> = report
+            .facts
+            .iter()
+            .filter(|fact| fact.panel)
+            .map(|fact| format!("{} {}", fact.label, fact.value))
+            .collect();
+        summary.extend(report.notes.iter().cloned());
         lines.push(Line::from(Span::styled(
-            clip(&report.notes.join(" · "), width),
+            clip(&summary.join(" · "), width),
             Style::default().fg(FAINT),
         )));
     }
@@ -658,19 +909,35 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::MemoryStore;
     use crate::model::Window;
     use chrono::TimeZone;
+
+    fn test_app() -> App {
+        let dir = std::env::temp_dir().join(format!("usagebar-ui-{}", std::process::id()));
+        App::new(
+            60,
+            Arc::new(MemoryStore::new()),
+            SortMode::Manual,
+            Arc::new(crate::credentials::FileStore::load(
+                dir.join("credentials.json"),
+            )),
+        )
+    }
 
     /// A failed poll must keep the previous vendor number, marked stale, rather than
     /// blanking a panel that was reporting fine a minute ago.
     #[test]
     fn failure_keeps_last_good_reading() {
-        let mut app = App::new(60);
-        let mut good = Report::new("Claude");
+        let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
+        let mut good = Report::new(ProviderId::Claude).key("claude");
         good.windows.push(Window::new("Weekly", 42.0));
         app.absorb(vec![good]);
 
-        app.absorb(vec![Report::failed("Claude", "HTTP 429".into())]);
+        app.absorb(vec![
+            Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")
+        ]);
 
         let report = &app.reports[0];
         assert_eq!(report.windows.len(), 1);
@@ -681,11 +948,33 @@ mod tests {
         }
     }
 
+    /// Two accounts of one provider are two panels, so one account's reading must not
+    /// overwrite the other's.
+    #[test]
+    fn accounts_of_one_provider_keep_separate_reports() {
+        let mut app = test_app();
+        app.accounts = vec![
+            AccountRef::new("claude-a", ProviderId::Claude),
+            AccountRef::new("claude-b", ProviderId::Claude),
+        ];
+        let mut first = Report::new(ProviderId::Claude).key("claude-a");
+        first.windows.push(Window::new("Weekly", 10.0));
+        let mut second = Report::new(ProviderId::Claude).key("claude-b");
+        second.windows.push(Window::new("Weekly", 80.0));
+        app.absorb(vec![first, second]);
+
+        assert_eq!(app.reports[0].windows[0].used_percent, 10.0);
+        assert_eq!(app.reports[1].windows[0].used_percent, 80.0);
+    }
+
     /// Without a previous reading there is nothing honest to show, so the error stands.
     #[test]
     fn failure_without_history_stays_unavailable() {
-        let mut app = App::new(60);
-        app.absorb(vec![Report::failed("Claude", "HTTP 429".into())]);
+        let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
+        app.absorb(vec![
+            Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")
+        ]);
         assert!(matches!(app.reports[0].health, Health::Unavailable(_)));
         assert!(app.reports[0].windows.is_empty());
     }
@@ -709,7 +998,7 @@ mod tests {
         assert_eq!(filled, 5);
     }
 
-    fn sample_report(provider: &'static str, windows: usize) -> Report {
+    fn sample_report(provider: ProviderId, windows: usize) -> Report {
         let mut report = Report::new(provider);
         for index in 0..windows {
             report.windows.push(Window::new(format!("W{index}"), 10.0));
@@ -721,9 +1010,9 @@ mod tests {
     /// down: it drops to a lighter drawing or holds panels back, visibly.
     #[test]
     fn plan_falls_back_to_a_density_that_fits() {
-        let reports: Vec<Report> = ["A", "B", "C"]
+        let reports: Vec<Report> = ProviderId::ALL[..3]
             .iter()
-            .map(|p| sample_report(p, 3))
+            .map(|p| sample_report(*p, 3))
             .collect();
         let rows: Vec<&[Report]> = reports.chunks(1).collect();
 
@@ -748,9 +1037,9 @@ mod tests {
 
     #[test]
     fn plan_reports_panels_it_could_not_fit() {
-        let reports: Vec<Report> = ["A", "B", "C", "D"]
+        let reports: Vec<Report> = ProviderId::ALL[..4]
             .iter()
-            .map(|p| sample_report(p, 3))
+            .map(|p| sample_report(*p, 3))
             .collect();
         let rows: Vec<&[Report]> = reports.chunks(1).collect();
 

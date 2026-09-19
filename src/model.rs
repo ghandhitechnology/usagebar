@@ -1,4 +1,7 @@
+//! The vocabulary every other module shares: providers, accounts, readings.
+
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Where a number came from. Every value shown is vendor-reported; this says which
 /// surface reported it so a wrong number can be traced back to its source.
@@ -14,6 +17,121 @@ impl Source {
             Source::Api => "api",
             Source::LocalFile => "local",
         }
+    }
+}
+
+/// The vendors this tool knows how to read. The set is fixed at compile time; a
+/// configured account always names one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProviderId {
+    #[serde(rename = "claude")]
+    Claude,
+    #[serde(rename = "codex")]
+    Codex,
+    #[serde(rename = "opencode-go")]
+    OpenCodeGo,
+    #[serde(rename = "cursor")]
+    Cursor,
+    #[serde(rename = "grok")]
+    Grok,
+    #[serde(rename = "devin")]
+    Devin,
+    #[serde(rename = "command-code")]
+    CommandCode,
+}
+
+impl ProviderId {
+    pub const ALL: [ProviderId; 7] = [
+        ProviderId::Claude,
+        ProviderId::Codex,
+        ProviderId::OpenCodeGo,
+        ProviderId::Cursor,
+        ProviderId::Grok,
+        ProviderId::Devin,
+        ProviderId::CommandCode,
+    ];
+
+    /// The stable name used in the config file and in account ids.
+    pub fn slug(self) -> &'static str {
+        match self {
+            ProviderId::Claude => "claude",
+            ProviderId::Codex => "codex",
+            ProviderId::OpenCodeGo => "opencode-go",
+            ProviderId::Cursor => "cursor",
+            ProviderId::Grok => "grok",
+            ProviderId::Devin => "devin",
+            ProviderId::CommandCode => "command-code",
+        }
+    }
+
+    pub fn display(self) -> &'static str {
+        match self {
+            ProviderId::Claude => "Claude",
+            ProviderId::Codex => "Codex",
+            ProviderId::OpenCodeGo => "OpenCode Go",
+            ProviderId::Cursor => "Cursor",
+            ProviderId::Grok => "Grok",
+            ProviderId::Devin => "Devin",
+            ProviderId::CommandCode => "Command Code",
+        }
+    }
+
+    /// One line on how this provider is connected, shown while picking a provider.
+    pub fn connect_hint(self) -> &'static str {
+        match self {
+            ProviderId::Claude => {
+                "OAuth pair from Claude Code, or an import of its credentials file"
+            }
+            ProviderId::Codex => "tokens from the Codex CLI's auth.json",
+            ProviderId::OpenCodeGo => "a Go API key from the OpenCode credential store",
+            ProviderId::Cursor => "the access token from cursor-agent's auth.json",
+            ProviderId::Grok => "the session key from the Grok CLI's auth.json",
+            ProviderId::Devin => "the windsurf_api_key from Devin's credentials.toml",
+            ProviderId::CommandCode => "the API key from the Command Code CLI's auth.json",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display())
+    }
+}
+
+/// One entry in the display list. Accounts exist in the config; their secrets live in
+/// the credential store under the same id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRef {
+    pub id: String,
+    pub provider: ProviderId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    /// Why a scan could not read this account's vendor file. Runtime only: a configured
+    /// account either has a credential or reports that it is missing one.
+    #[serde(skip)]
+    pub problem: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl AccountRef {
+    pub fn new(id: impl Into<String>, provider: ProviderId) -> Self {
+        Self {
+            id: id.into(),
+            provider,
+            label: None,
+            hidden: false,
+            problem: None,
+        }
+    }
+
+    pub fn problem(mut self, problem: impl Into<String>) -> Self {
+        self.problem = Some(problem.into());
+        self
     }
 }
 
@@ -48,6 +166,35 @@ impl Window {
     }
 }
 
+/// A vendor number that is not a quota window: a balance, a reset credit count, a
+/// per-model availability. Panels flatten these into one faint line; the detail view
+/// gives each its own row.
+#[derive(Debug, Clone)]
+pub struct Fact {
+    pub label: String,
+    pub value: String,
+    /// Whether the panel's one-line summary shows it. A quiet fact only appears in the
+    /// detail view, so panels stay short while nothing is lost.
+    pub panel: bool,
+}
+
+impl Fact {
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            panel: true,
+        }
+    }
+
+    pub fn quiet(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            panel: false,
+            ..Self::new(label, value)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Health {
     Ok,
@@ -63,34 +210,54 @@ pub enum Health {
 
 #[derive(Debug, Clone)]
 pub struct Report {
-    pub provider: &'static str,
+    /// The account this reading belongs to, so two accounts of the same provider
+    /// never collapse into one panel.
+    pub key: String,
+    pub provider: ProviderId,
+    /// Configured display label, when the account has one.
+    pub label: Option<String>,
     pub account: Option<String>,
     pub plan: Option<String>,
     pub windows: Vec<Window>,
-    /// Balances and other flat vendor numbers shown below the windows.
+    /// Flat vendor numbers shown below the windows.
+    pub facts: Vec<Fact>,
+    /// Prose caveats, e.g. "from last local rollout".
     pub notes: Vec<String>,
     pub source: Source,
     pub health: Health,
 }
 
 impl Report {
-    pub fn new(provider: &'static str) -> Self {
+    pub fn new(provider: ProviderId) -> Self {
         Self {
+            key: provider.slug().to_string(),
             provider,
+            label: None,
             account: None,
             plan: None,
             windows: Vec::new(),
+            facts: Vec::new(),
             notes: Vec::new(),
             source: Source::Api,
             health: Health::Ok,
         }
     }
 
-    pub fn failed(provider: &'static str, why: String) -> Self {
+    pub fn failed(provider: ProviderId, why: String) -> Self {
         Self {
             health: Health::Unavailable(why),
             ..Self::new(provider)
         }
+    }
+
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = key.into();
+        self
+    }
+
+    pub fn label(mut self, label: Option<String>) -> Self {
+        self.label = label;
+        self
     }
 
     pub fn account(mut self, account: Option<String>) -> Self {
@@ -108,6 +275,11 @@ impl Report {
         self
     }
 
+    pub fn fact(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
+        self.facts.push(Fact::new(label, value));
+        self
+    }
+
     /// Highest used percent in this report, used for sorting and for the header summary.
     pub fn peak(&self) -> Option<f64> {
         self.windows
@@ -116,6 +288,10 @@ impl Report {
             .fold(None, |acc: Option<f64>, v| {
                 Some(acc.map_or(v, |a| a.max(v)))
             })
+    }
+
+    pub fn health_is_ok(&self) -> bool {
+        matches!(self.health, Health::Ok)
     }
 }
 

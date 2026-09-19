@@ -1,51 +1,71 @@
+mod config;
+mod credentials;
+mod detail;
+mod fsutil;
+mod input;
 mod model;
 mod providers;
 mod render;
+mod settings;
 mod ui;
+mod wizard;
 
-use std::io::IsTerminal;
-use std::sync::mpsc;
+use std::io::{IsTerminal, Write};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+};
+use crossterm::execute;
 use serde_json::{json, Value};
 
-use model::{Health, Report};
-use ui::App;
+use config::{Config, SortMode};
+use credentials::{CredentialStore, FileStore, MemoryStore};
+use model::{AccountRef, Health, Report};
+use settings::Settings;
+use ui::{App, Overlay, OverlayAction};
+use wizard::Wizard;
 
-const DEFAULT_INTERVAL: u64 = 60;
+const DEFAULT_INTERVAL: u64 = config::DEFAULT_INTERVAL;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!(
-            "usagebar — live subscription usage, one panel per provider\n\n\
-             USAGE: usagebar [OPTIONS]\n\n\
-             OPTIONS:\n\
-             \x20 --interval <SECS>   refresh cadence in the TUI (default {DEFAULT_INTERVAL})\n\
-             \x20 --json             print one snapshot as JSON and exit\n\
-             \x20 --once             print one snapshot as a table and exit\n\
-             \x20 --render           draw frames to stdout, for narrow panes and screenshots\n\
-             \x20 --width <COLS>     frame width for --render (default 80)\n\
-             \x20 --height <ROWS>    frame height for --render (default 24)\n\
-             \x20 --sizes <LIST>     several frames at once, e.g. 80x24,140x45\n\
-             \x20 -h, --help         show this text\n"
-        );
-        return Ok(());
+        return out(&help());
     }
 
-    let interval = args
-        .iter()
-        .position(|a| a == "--interval")
-        .and_then(|i| args.get(i + 1))
+    let dir = config::dir();
+    let config_path = config::config_path(&dir);
+    let file_store = Arc::new(FileStore::load(config::credentials_path(&dir)));
+    let (config, config_error) = match config::load(&config_path) {
+        Ok(Some(config)) => (Some(config), None),
+        Ok(None) => (None, None),
+        Err(why) => {
+            // The overlay footer is narrow; the full error goes to stderr.
+            eprintln!("usagebar: {why}");
+            (
+                None,
+                Some("config.json is unreadable; setup will start fresh".into()),
+            )
+        }
+    };
+
+    let cli_interval = arg_value(&args, "--interval")
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_INTERVAL)
-        .max(5);
+        .map(|secs| secs.max(config::MIN_INTERVAL));
+    let interval = cli_interval.unwrap_or_else(|| {
+        config
+            .as_ref()
+            .map(Config::interval)
+            .unwrap_or(DEFAULT_INTERVAL)
+    });
 
     if args.iter().any(|a| a == "--json") {
-        println!("{}", serde_json::to_string_pretty(&snapshot())?);
-        return Ok(());
+        let (accounts, store) = boot(&config, &file_store);
+        let snapshot = snapshot(&accounts, &store, sort_mode(&config));
+        return out(&format!("{}\n", serde_json::to_string_pretty(&snapshot)?));
     }
     if args.iter().any(|a| a == "--render") {
         let width = flag(&args, "--width").unwrap_or(80).clamp(20, 400) as u16;
@@ -54,19 +74,74 @@ fn main() -> std::io::Result<()> {
             Some(list) => parse_sizes(&list).unwrap_or_else(|| vec![(width, height)]),
             None => vec![(width, height)],
         };
-        let mut app = App::new(interval);
-        app.absorb(providers::fetch_all());
+        let (accounts, store) = boot(&config, &file_store);
+        let mut app = App::new(interval, store, sort_mode(&config), Arc::clone(&file_store));
+        app.accounts = accounts;
+        app.absorb(providers::fetch_all(
+            &app.accounts,
+            &app.store,
+            app.config.sort,
+        ));
+        let mut frames = String::new();
         for (w, h) in sizes {
-            println!("--- {w}x{h}");
-            print!("{}", render::to_ansi(w, h, &app).unwrap());
+            frames.push_str(&format!("--- {w}x{h}\n"));
+            frames.push_str(&render::to_ansi(w, h, &app).unwrap());
         }
-        return Ok(());
+        return out(&frames);
     }
     if args.iter().any(|a| a == "--once") {
-        print_table(&providers::fetch_all());
-        return Ok(());
+        let (accounts, store) = boot(&config, &file_store);
+        let table = table(&providers::fetch_all(&accounts, &store, sort_mode(&config)));
+        return out(&table);
     }
-    run_tui(interval)
+    run_tui(
+        interval,
+        config,
+        config_error,
+        file_store,
+        cli_interval.is_some(),
+    )
+}
+
+fn help() -> String {
+    format!(
+        "usagebar — live subscription usage, one panel per provider\n\n\
+         USAGE: usagebar [OPTIONS]\n\n\
+         OPTIONS:\n\
+         \x20 --interval <SECS>   refresh cadence, overriding the saved setting (default {DEFAULT_INTERVAL})\n\
+         \x20 --json             print one snapshot as JSON and exit\n\
+         \x20 --once             print one snapshot as a table and exit\n\
+         \x20 --render           draw frames to stdout, for narrow panes and screenshots\n\
+         \x20 --width <COLS>     frame width for --render (default 80)\n\
+         \x20 --height <ROWS>    frame height for --render (default 24)\n\
+         \x20 --sizes <LIST>     several frames at once, e.g. 80x24,140x45\n\
+         \x20 -h, --help         show this text\n\n\
+         KEYS: q quit · r refresh · space pause · s setup · d details\n\
+         Config: ~/.config/usagebar/config.json (override with USAGEBAR_CONFIG_DIR)\n"
+    )
+}
+
+fn sort_mode(config: &Option<Config>) -> SortMode {
+    config.as_ref().map(|c| c.sort).unwrap_or(SortMode::Smart)
+}
+
+/// Accounts to read this run. A config with accounts is authoritative; anything else
+/// (no config, an empty list, an unreadable file) falls back to scanning the machine,
+/// which is also the behavior of every version before accounts existed.
+fn boot(
+    config: &Option<Config>,
+    file_store: &Arc<FileStore>,
+) -> (Vec<AccountRef>, Arc<dyn CredentialStore>) {
+    match config {
+        Some(config) if !config.auto_detect() => (
+            config.accounts.clone(),
+            Arc::clone(file_store) as Arc<dyn CredentialStore>,
+        ),
+        _ => {
+            let (accounts, store) = providers::accounts_from_detected(&providers::detect());
+            (accounts, Arc::new(store) as Arc<dyn CredentialStore>)
+        }
+    }
 }
 
 fn flag(args: &[String], name: &str) -> Option<u64> {
@@ -93,8 +168,8 @@ fn parse_sizes(list: &str) -> Option<Vec<(u16, u16)>> {
         .collect()
 }
 
-fn snapshot() -> Value {
-    let reports = providers::fetch_all();
+fn snapshot(accounts: &[AccountRef], store: &Arc<dyn CredentialStore>, sort: SortMode) -> Value {
+    let reports = providers::fetch_all(accounts, store, sort);
     json!({
         "captured_at": Utc::now().to_rfc3339(),
         "reports": reports.iter().map(report_json).collect::<Vec<_>>(),
@@ -113,7 +188,9 @@ fn report_json(report: &Report) -> Value {
         Health::Unavailable(why) => json!({"state": "unavailable", "detail": why}),
     };
     json!({
-        "provider": report.provider,
+        "account_id": report.key,
+        "provider": report.provider.display(),
+        "label": report.label,
         "account": report.account,
         "plan": report.plan,
         "source": report.source.glyph(),
@@ -124,40 +201,69 @@ fn report_json(report: &Report) -> Value {
             "resets_at": w.resets_at.map(|t| t.to_rfc3339()),
             "detail": w.detail,
         })).collect::<Vec<_>>(),
+        "facts": report.facts.iter().map(|f| json!({
+            "label": f.label,
+            "value": f.value,
+        })).collect::<Vec<_>>(),
         "notes": report.notes,
     })
 }
 
-fn print_table(reports: &[Report]) {
+fn table(reports: &[Report]) -> String {
+    let mut out = String::new();
     for report in reports {
         let plan = report.plan.clone().unwrap_or_default();
-        println!("{} {}", report.provider, plan);
+        let name = match &report.label {
+            Some(label) => format!("{} · {label}", report.provider.display()),
+            None => report.provider.display().to_string(),
+        };
+        out.push_str(&format!("{} {}\n", name, plan));
         match &report.health {
             Health::Ok => {}
-            Health::NoQuota(why) => println!("  no quota reported: {why}"),
-            Health::Stale { why, since } => {
-                println!("  stale ({}s ago): {why}", since.elapsed().as_secs())
-            }
-            Health::Unavailable(why) => println!("  unavailable: {why}"),
+            Health::NoQuota(why) => out.push_str(&format!("  no quota reported: {why}\n")),
+            Health::Stale { why, since } => out.push_str(&format!(
+                "  stale ({}s ago): {why}\n",
+                since.elapsed().as_secs()
+            )),
+            Health::Unavailable(why) => out.push_str(&format!("  unavailable: {why}\n")),
         }
         for window in &report.windows {
-            println!(
-                "  {:<16} {:>5.1}%  {}",
+            out.push_str(&format!(
+                "  {:<16} {:>5.1}%  {}\n",
                 window.label,
                 window.used_percent,
                 window
                     .resets_at
                     .map(|t| format!("resets {}", t.to_rfc3339()))
                     .unwrap_or_default()
-            );
+            ));
+        }
+        for fact in report.facts.iter().filter(|fact| fact.panel) {
+            out.push_str(&format!("  {} {}\n", fact.label, fact.value));
         }
         for note in &report.notes {
-            println!("  {note}");
+            out.push_str(&format!("  {note}\n"));
         }
+    }
+    out
+}
+
+/// A reader that goes away (`usge --once | head`) is not a failure.
+fn out(text: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(text.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
     }
 }
 
-fn run_tui(interval: u64) -> std::io::Result<()> {
+fn run_tui(
+    interval: u64,
+    config: Option<Config>,
+    config_error: Option<String>,
+    file_store: Arc<FileStore>,
+    interval_locked: bool,
+) -> std::io::Result<()> {
     // Without a terminal this would panic deep inside ratatui; say what to do instead.
     if !std::io::stdout().is_terminal() {
         eprintln!(
@@ -165,54 +271,176 @@ fn run_tui(interval: u64) -> std::io::Result<()> {
         );
         std::process::exit(2);
     }
-    let mut app = App::new(interval);
+
+    let persisted = config.is_some();
+    let saved_accounts = config
+        .as_ref()
+        .filter(|config| !config.auto_detect())
+        .map(|config| config.accounts.clone())
+        .unwrap_or_default();
+    let store: Arc<dyn CredentialStore> = if persisted && !saved_accounts.is_empty() {
+        Arc::clone(&file_store) as Arc<dyn CredentialStore>
+    } else {
+        Arc::new(MemoryStore::new())
+    };
+    let mut app = App::new(interval, store, sort_mode(&config), Arc::clone(&file_store));
+    app.accounts = saved_accounts;
+    app.interval_locked = interval_locked;
+    app.config = config.unwrap_or(Config {
+        interval_secs: interval,
+        sort: SortMode::Smart,
+        ..Config::default()
+    });
+    app.config_path = config::config_path(&config::dir());
+    app.persisted = persisted;
+    app.file_store = Arc::clone(&file_store);
+    app.boot_note = config_error;
+
     let (tx, rx) = mpsc::channel::<Vec<Report>>();
-    trigger(&tx);
-    app.refreshing = true;
+    let (scan_tx, scan_rx) = mpsc::channel::<Vec<providers::Detected>>();
+    let scanning = if app.accounts.is_empty() {
+        std::thread::spawn(move || {
+            let _ = scan_tx.send(providers::detect());
+        });
+        true
+    } else {
+        trigger(&tx, &app.accounts, &app.store, app.config.sort);
+        app.refreshing = true;
+        false
+    };
 
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let tick = Duration::from_millis(120);
     let mut last_trigger = Instant::now();
     let result = loop {
+        if scanning {
+            if let Ok(detected) = scan_rx.try_recv() {
+                let (accounts, detected_store) = providers::accounts_from_detected(&detected);
+                let detected_store = Arc::new(detected_store);
+                app.accounts = accounts;
+                app.store = Arc::clone(&detected_store) as Arc<dyn CredentialStore>;
+                app.detected_store = Some(detected_store);
+                // Nothing saved yet means this is the first run; offer setup.
+                if !app.persisted && app.overlay.is_none() {
+                    app.overlay = Some(Overlay::Wizard(Wizard::new(detected, app.config.sort)));
+                }
+                trigger(&tx, &app.accounts, &app.store, app.config.sort);
+                app.refreshing = true;
+                last_trigger = Instant::now();
+            }
+        }
         if let Ok(reports) = rx.try_recv() {
             app.absorb(reports);
         }
-        let due = !app.paused && last_trigger.elapsed() >= Duration::from_secs(interval);
-        if due {
-            trigger(&tx);
+        let due = !app.paused && last_trigger.elapsed() >= Duration::from_secs(app.interval_secs);
+        if due && !app.accounts.is_empty() {
+            trigger(&tx, &app.accounts, &app.store, app.config.sort);
             app.refreshing = true;
             last_trigger = Instant::now();
         }
 
+        if let Some(overlay) = app.overlay.as_mut() {
+            overlay.poll();
+        }
         if let Err(error) = terminal.draw(|frame| ui::draw(frame, &app)) {
             break Err(error);
         }
 
         if event::poll(tick)? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                    KeyCode::Char('r') => {
-                        trigger(&tx);
-                        app.refreshing = true;
-                        last_trigger = Instant::now();
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if let Some(mut overlay) = app.overlay.take() {
+                        let action = overlay.handle(&mut app, key);
+                        match action {
+                            OverlayAction::Keep => app.overlay = Some(overlay),
+                            OverlayAction::Close => {
+                                // Closing the first-run wizard without saving still
+                                // records the skip, so it does not open every launch.
+                                if matches!(overlay, Overlay::Wizard(_)) && !app.persisted {
+                                    // A file that exists but did not parse is kept aside
+                                    // rather than overwritten; its accounts may still be
+                                    // recoverable by hand.
+                                    if app.config_path.exists() {
+                                        match crate::fsutil::set_aside(
+                                            &app.config_path,
+                                            "unreadable",
+                                        ) {
+                                            Ok(aside) => eprintln!(
+                                                "usagebar: kept the unreadable config at {}",
+                                                aside.display()
+                                            ),
+                                            Err(why) => eprintln!("usagebar: {why}"),
+                                        }
+                                    }
+                                    // An explicit "keep scanning", so an empty account
+                                    // list stays unambiguous.
+                                    app.config.detect = Some(true);
+                                    let _ = app.save_config();
+                                }
+                                app.boot_note = None;
+                            }
+                            OverlayAction::Refresh => {
+                                app.overlay = Some(overlay);
+                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
+                                app.refreshing = true;
+                                last_trigger = Instant::now();
+                            }
+                            OverlayAction::Saved => {
+                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
+                                app.refreshing = true;
+                                last_trigger = Instant::now();
+                            }
+                            OverlayAction::OpenWizard => {
+                                app.overlay =
+                                    Some(Overlay::Wizard(Wizard::new_add(app.config.sort)));
+                            }
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                            KeyCode::Char('r') => {
+                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
+                                app.refreshing = true;
+                                last_trigger = Instant::now();
+                            }
+                            KeyCode::Char(' ') => app.paused = !app.paused,
+                            KeyCode::Char('s') => {
+                                app.overlay = Some(Overlay::Settings(Settings::default()))
+                            }
+                            KeyCode::Char('d') => {
+                                app.overlay = Some(Overlay::Detail(detail::Detail::new()))
+                            }
+                            _ => {}
+                        }
                     }
-                    KeyCode::Char(' ') => app.paused = !app.paused,
-                    _ => {}
-                },
+                }
+                Event::Paste(text) => {
+                    if let Some(overlay) = app.overlay.as_mut() {
+                        overlay.paste(&text);
+                    }
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
         }
     };
 
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
 
-fn trigger(tx: &mpsc::Sender<Vec<Report>>) {
+fn trigger(
+    tx: &mpsc::Sender<Vec<Report>>,
+    accounts: &[AccountRef],
+    store: &Arc<dyn CredentialStore>,
+    sort: SortMode,
+) {
     let tx = tx.clone();
+    let accounts = accounts.to_vec();
+    let store = Arc::clone(store);
     std::thread::spawn(move || {
-        let _ = tx.send(providers::fetch_all());
+        let _ = tx.send(providers::fetch_all(&accounts, &store, sort));
     });
 }
