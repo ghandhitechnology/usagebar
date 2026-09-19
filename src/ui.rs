@@ -237,6 +237,10 @@ pub(crate) const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
 pub(crate) const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
 const TRACK: Color = Color::Rgb(0x33, 0x36, 0x3D);
 
+/// How much of a colour survives the backdrop under an open overlay, in percent.
+/// opencode dims its own settings screen to this same ratio.
+const BACKDROP: u16 = 41;
+
 pub(crate) fn provider_color(provider: ProviderId) -> Color {
     match provider {
         ProviderId::Claude => Color::Rgb(0xD9, 0x77, 0x57),
@@ -356,11 +360,34 @@ pub fn draw(frame: &mut Frame, app: &App) {
     header(frame, app, chunks[0]);
     grid(frame, app, chunks[1]);
     footer(frame, app, chunks[2]);
+    if app.overlay.is_some() {
+        backdrop(frame);
+    }
     match &app.overlay {
         Some(Overlay::Settings(settings)) => settings::draw(frame, app, settings, area),
         Some(Overlay::Wizard(wizard)) => wizard::draw(frame, app, wizard, area),
         Some(Overlay::Detail(detail)) => crate::detail::draw(frame, app, detail, area),
         None => {}
+    }
+}
+
+/// Drops everything drawn so far towards the background, so an open overlay reads as
+/// the only live surface. Each colour keeps its hue and loses most of its brightness;
+/// bold goes with it, since a bright weight would punch back through the veil.
+fn backdrop(frame: &mut Frame) {
+    for cell in frame.buffer_mut().content.iter_mut() {
+        cell.fg = faded(cell.fg);
+        cell.bg = faded(cell.bg);
+        cell.modifier.remove(Modifier::BOLD);
+    }
+}
+
+fn faded(color: Color) -> Color {
+    let dim = |channel: u8| (u16::from(channel) * BACKDROP / 100) as u8;
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(dim(r), dim(g), dim(b)),
+        // Everything else is the terminal's own colour, which is already the backdrop.
+        other => other,
     }
 }
 
@@ -912,6 +939,8 @@ mod tests {
     use crate::credentials::MemoryStore;
     use crate::model::Window;
     use chrono::TimeZone;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn test_app() -> App {
         let dir = std::env::temp_dir().join(format!("usagebar-ui-{}", std::process::id()));
@@ -1049,5 +1078,39 @@ mod tests {
         assert_eq!(density, Density::Row);
         assert_eq!(heights.len(), 2);
         assert_eq!(hidden, 2);
+    }
+
+    /// An open overlay drops the view behind it to the backdrop and leaves itself alone.
+    #[test]
+    fn the_setup_overlay_dims_the_view_behind_it() {
+        let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
+        app.absorb(vec![sample_report(ProviderId::Claude, 2)]);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let plain = terminal.backend().buffer().clone();
+
+        app.overlay = Some(Overlay::Settings(Settings::default()));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let veiled = terminal.backend().buffer().clone();
+
+        // The header and footer sit outside the centered panel, so every coloured cell
+        // there keeps its place and loses its brightness.
+        let mut compared = 0;
+        for y in [0, 1, 38] {
+            for x in 0..120 {
+                let (before, after) = (plain[(x, y)].clone(), veiled[(x, y)].clone());
+                assert_eq!(after.symbol(), before.symbol());
+                if let Color::Rgb(..) = before.fg {
+                    assert_eq!(after.fg, faded(before.fg));
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 4, "the header should carry colour to compare");
+
+        // The panel is drawn after the backdrop, so its accent survives untouched.
+        assert!(veiled.content().iter().any(|cell| cell.fg == ACCENT));
     }
 }
