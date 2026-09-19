@@ -731,7 +731,7 @@ fn row_line(frame: &mut Frame, report: &Report, area: Rect) {
         Some(window) => {
             let label_width = 9.min(width / 5);
             let reserved = name_width + label_width + 1 + 4 + 1;
-            let bar_width = width.saturating_sub(reserved).clamp(4, 40);
+            let bar_width = width.saturating_sub(reserved).max(4);
             spans.push(Span::styled(
                 pad(&window.label, label_width),
                 Style::default().fg(DIM),
@@ -852,8 +852,11 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
         } else {
             0
         };
+        // The bar takes every column the label, percentage, and countdown do not, so its
+        // right edge meets the panel edge and the detail text below it, instead of
+        // stopping short and leaving the numbers floating in the middle of the panel.
         let reserved = label_width + 1 + 4 + 1 + reset_width;
-        let bar_width = width.saturating_sub(reserved).clamp(6, 44);
+        let bar_width = width.saturating_sub(reserved).max(6);
 
         let mut row = vec![
             Span::styled(pad(&window.label, label_width), Style::default().fg(TEXT)),
