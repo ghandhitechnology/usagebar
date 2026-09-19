@@ -65,14 +65,6 @@ impl Config {
         self.interval_secs.max(MIN_INTERVAL)
     }
 
-    pub fn visible(&self) -> impl Iterator<Item = &AccountRef> {
-        self.accounts.iter().filter(|account| !account.hidden)
-    }
-
-    pub fn index_of(&self, id: &str) -> Option<usize> {
-        self.accounts.iter().position(|account| account.id == id)
-    }
-
     /// A unique id for a new account, e.g. "claude", then "claude-2".
     pub fn next_id(&self, provider: crate::model::ProviderId) -> String {
         let base = provider.slug();
@@ -155,7 +147,7 @@ mod tests {
         assert_eq!(loaded.sort, SortMode::Smart);
         assert_eq!(loaded.accounts[0].id, "claude-work");
         assert!(loaded.accounts[1].hidden);
-        assert_eq!(loaded.visible().count(), 1);
+        assert_eq!(loaded.accounts[1].hidden, true);
         std::fs::remove_dir_all(&dir).ok();
     }
 

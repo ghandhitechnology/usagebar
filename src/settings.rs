@@ -27,6 +27,7 @@ pub enum Action {
     Keep,
     Close,
     Refresh,
+    OpenWizard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +129,7 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
         },
         Row::AddAccount => {
             if matches!(key.code, KeyCode::Enter) {
-                settings.note = Some("adding accounts arrives with the setup wizard".into());
+                return Action::OpenWizard;
             }
         }
         Row::Sort => {

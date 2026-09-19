@@ -48,12 +48,6 @@ impl TextInput {
         self.scroll = 0;
     }
 
-    pub fn clear(&mut self) {
-        self.value.clear();
-        self.cursor = 0;
-        self.scroll = 0;
-    }
-
     fn byte_at(&self, char_index: usize) -> usize {
         self.value
             .char_indices()

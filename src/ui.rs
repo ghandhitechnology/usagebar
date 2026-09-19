@@ -17,6 +17,7 @@ use crate::config::{self, Config, SortMode};
 use crate::credentials::{CredentialStore, FileStore, MemoryStore};
 use crate::model::{AccountRef, Health, ProviderId, Report};
 use crate::settings::{self, Settings};
+use crate::wizard::{self, Wizard};
 
 pub struct App {
     pub reports: Vec<Report>,
@@ -47,6 +48,8 @@ pub struct App {
 /// The modal screens. One at a time; the base view owns every key when this is None.
 pub enum Overlay {
     Settings(Settings),
+    Wizard(Wizard),
+    Detail(crate::detail::Detail),
 }
 
 impl Overlay {
@@ -56,6 +59,16 @@ impl Overlay {
                 settings::Action::Keep => OverlayAction::Keep,
                 settings::Action::Close => OverlayAction::Close,
                 settings::Action::Refresh => OverlayAction::Refresh,
+                settings::Action::OpenWizard => OverlayAction::OpenWizard,
+            },
+            Overlay::Wizard(wizard) => match wizard::handle(wizard, app, key) {
+                wizard::Action::Keep => OverlayAction::Keep,
+                wizard::Action::Close => OverlayAction::Close,
+                wizard::Action::Saved => OverlayAction::Saved,
+            },
+            Overlay::Detail(detail) => match crate::detail::handle(detail, app, key) {
+                crate::detail::Action::Keep => OverlayAction::Keep,
+                crate::detail::Action::Close => OverlayAction::Close,
             },
         }
     }
@@ -68,6 +81,15 @@ impl Overlay {
                     input.paste(text);
                 }
             }
+            Overlay::Wizard(wizard) => wizard.paste(text),
+            Overlay::Detail(_) => {}
+        }
+    }
+
+    /// Called every tick so background work can land without blocking the UI.
+    pub fn poll(&mut self) {
+        if let Overlay::Wizard(wizard) = self {
+            wizard.poll();
         }
     }
 }
@@ -75,7 +97,11 @@ impl Overlay {
 pub enum OverlayAction {
     Keep,
     Close,
+    /// Keep the overlay open, but re-read every account.
     Refresh,
+    /// The overlay is done and closed; re-read every account.
+    Saved,
+    OpenWizard,
 }
 
 impl App {
@@ -210,7 +236,7 @@ pub(crate) const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
 pub(crate) const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
 const TRACK: Color = Color::Rgb(0x33, 0x36, 0x3D);
 
-fn provider_color(provider: ProviderId) -> Color {
+pub(crate) fn provider_color(provider: ProviderId) -> Color {
     match provider {
         ProviderId::Claude => Color::Rgb(0xD9, 0x77, 0x57),
         ProviderId::Codex => Color::Rgb(0x4F, 0xB8, 0x9A),
@@ -223,7 +249,7 @@ fn provider_color(provider: ProviderId) -> Color {
 }
 
 /// Filled-bar ramp, cool when there is headroom and hot when there is not.
-fn ramp(percent: f64, position: f64) -> Color {
+pub(crate) fn ramp(percent: f64, position: f64) -> Color {
     let (from, to) = match percent {
         p if p >= 95.0 => ((0xD6, 0x45, 0x45), (0xF2, 0x6B, 0x6B)),
         p if p >= 85.0 => ((0xE0, 0x7A, 0x5F), (0xF2, 0x9E, 0x7E)),
@@ -236,7 +262,7 @@ fn ramp(percent: f64, position: f64) -> Color {
 
 const PARTIALS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
-fn bar_spans(percent: f64, width: usize) -> Vec<Span<'static>> {
+pub(crate) fn bar_spans(percent: f64, width: usize) -> Vec<Span<'static>> {
     let clamped = percent.clamp(0.0, 100.0);
     let exact = clamped / 100.0 * width as f64;
     let full = exact.floor() as usize;
@@ -332,6 +358,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     footer(frame, app, chunks[2]);
     match &app.overlay {
         Some(Overlay::Settings(settings)) => settings::draw(frame, app, settings, area),
+        Some(Overlay::Wizard(wizard)) => wizard::draw(frame, app, wizard, area),
+        Some(Overlay::Detail(detail)) => crate::detail::draw(frame, app, detail, area),
         None => {}
     }
 }
@@ -426,6 +454,8 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("pause ", Style::default().fg(DIM)),
         Span::styled(" s ", Style::default().fg(ACCENT)),
         Span::styled("setup ", Style::default().fg(DIM)),
+        Span::styled(" d ", Style::default().fg(ACCENT)),
+        Span::styled("details ", Style::default().fg(DIM)),
     ];
     if let Some(note) = &app.boot_note {
         spans.push(Span::styled(

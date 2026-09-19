@@ -1,5 +1,6 @@
 mod config;
 mod credentials;
+mod detail;
 mod fsutil;
 mod input;
 mod model;
@@ -7,6 +8,7 @@ mod providers;
 mod render;
 mod settings;
 mod ui;
+mod wizard;
 
 use std::io::IsTerminal;
 use std::sync::{mpsc, Arc};
@@ -24,6 +26,7 @@ use credentials::{CredentialStore, FileStore, MemoryStore};
 use model::{AccountRef, Health, Report};
 use settings::Settings;
 use ui::{App, Overlay, OverlayAction};
+use wizard::Wizard;
 
 const DEFAULT_INTERVAL: u64 = config::DEFAULT_INTERVAL;
 
@@ -297,6 +300,10 @@ fn run_tui(
                 app.accounts = accounts;
                 app.store = Arc::clone(&detected_store) as Arc<dyn CredentialStore>;
                 app.detected_store = Some(detected_store);
+                // Nothing saved yet means this is the first run; offer setup.
+                if !app.persisted && app.overlay.is_none() {
+                    app.overlay = Some(Overlay::Wizard(Wizard::new(detected, app.config.sort)));
+                }
                 trigger(&tx, &app.accounts, &app.store, app.config.sort);
                 app.refreshing = true;
                 last_trigger = Instant::now();
@@ -312,6 +319,9 @@ fn run_tui(
             last_trigger = Instant::now();
         }
 
+        if let Some(overlay) = app.overlay.as_mut() {
+            overlay.poll();
+        }
         if let Err(error) = terminal.draw(|frame| ui::draw(frame, &app)) {
             break Err(error);
         }
@@ -322,13 +332,29 @@ fn run_tui(
                     if let Some(mut overlay) = app.overlay.take() {
                         let action = overlay.handle(&mut app, key);
                         match action {
-                            OverlayAction::Close => {}
                             OverlayAction::Keep => app.overlay = Some(overlay),
+                            OverlayAction::Close => {
+                                // Closing the first-run wizard without saving still
+                                // records the skip, so it does not open every launch.
+                                if matches!(overlay, Overlay::Wizard(_)) && !app.persisted {
+                                    let _ = app.save_config();
+                                }
+                                app.boot_note = None;
+                            }
                             OverlayAction::Refresh => {
                                 app.overlay = Some(overlay);
                                 trigger(&tx, &app.accounts, &app.store, app.config.sort);
                                 app.refreshing = true;
                                 last_trigger = Instant::now();
+                            }
+                            OverlayAction::Saved => {
+                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
+                                app.refreshing = true;
+                                last_trigger = Instant::now();
+                            }
+                            OverlayAction::OpenWizard => {
+                                app.overlay =
+                                    Some(Overlay::Wizard(Wizard::new_add(app.config.sort)));
                             }
                         }
                     } else {
@@ -342,6 +368,9 @@ fn run_tui(
                             KeyCode::Char(' ') => app.paused = !app.paused,
                             KeyCode::Char('s') => {
                                 app.overlay = Some(Overlay::Settings(Settings::default()))
+                            }
+                            KeyCode::Char('d') => {
+                                app.overlay = Some(Overlay::Detail(detail::Detail::new()))
                             }
                             _ => {}
                         }

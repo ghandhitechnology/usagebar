@@ -39,48 +39,6 @@ pub enum Credential {
     },
 }
 
-impl Credential {
-    /// Where the secret came from, so a rotated copy can be written back there.
-    pub fn describe(&self) -> String {
-        match self {
-            Credential::ClaudeOauth { expires_at, .. } => {
-                let now = Utc::now().timestamp_millis();
-                if *expires_at > now {
-                    format!("OAuth pair, expires in {}", human_minutes((expires_at - now) / 60_000))
-                } else {
-                    "OAuth pair, access token expired".to_string()
-                }
-            }
-            Credential::CodexTokens { account_id, .. } => match account_id {
-                Some(id) => format!("Codex tokens for {}", mask(id)),
-                None => "Codex tokens".to_string(),
-            },
-            Credential::Token { token } => format!("token {}", mask(token)),
-        }
-    }
-}
-
-fn human_minutes(minutes: i64) -> String {
-    match minutes {
-        m if m < 2 => "under a minute".to_string(),
-        m if m < 60 => format!("{m} minutes"),
-        m if m < 60 * 48 => format!("{} hours", m / 60),
-        m => format!("{} days", m / (60 * 24)),
-    }
-}
-
-/// Keeps the first and last few characters so a human can tell two secrets apart
-/// without either being readable.
-pub fn mask(secret: &str) -> String {
-    let chars: Vec<char> = secret.chars().collect();
-    if chars.len() <= 10 {
-        return "…".to_string();
-    }
-    let head: String = chars[..4].iter().collect();
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    format!("{head}…{tail}")
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredCredential {
     pub secret: Credential,
@@ -148,10 +106,6 @@ impl FileStore {
             path,
             doc: Mutex::new(doc),
         }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     fn flush(&self, doc: &StoreDoc) -> Result<(), String> {
@@ -445,7 +399,6 @@ mod tests {
             }
             other => panic!("wrong shape: {other:?}"),
         }
-        assert_eq!(mask("sk-ant-oat01-abcdefgh"), "sk-a…efgh");
         std::fs::remove_dir_all(&dir).ok();
     }
 

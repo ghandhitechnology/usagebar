@@ -22,11 +22,6 @@ const TIMEOUT: Duration = Duration::from_secs(25);
 
 pub type Result<T> = std::result::Result<T, String>;
 
-fn read_json(path: &Path) -> Result<Value> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))
-}
-
 fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value)> {
     let mut req = ureq::get(url)
         .config()
@@ -1088,8 +1083,13 @@ pub fn fetch_all(
 }
 
 /// Check a credential before the user commits to it. One live call, and the vendor's
-/// own answer decides whether the account is usable.
-pub fn verify(provider: ProviderId, credential: &Credential, origin: Option<&Path>) -> Result<Report> {
+/// own answer decides whether the account is usable. The credential comes back too,
+/// because a provider that refreshes during the call has a new one to keep.
+pub fn verify(
+    provider: ProviderId,
+    credential: &Credential,
+    origin: Option<&Path>,
+) -> Result<(Report, Credential)> {
     let account = AccountRef::new("verify", provider);
     let store = MemoryStore::new();
     store.put(
@@ -1098,7 +1098,13 @@ pub fn verify(provider: ProviderId, credential: &Credential, origin: Option<&Pat
     );
     let report = fetch_one(&account, &store);
     match report.health {
-        Health::Ok | Health::NoQuota(_) => Ok(report),
+        Health::Ok | Health::NoQuota(_) => {
+            let effective = store
+                .get("verify")
+                .map(|stored| stored.secret)
+                .unwrap_or_else(|| credential.clone());
+            Ok((report, effective))
+        }
         Health::Unavailable(why) | Health::Stale { why, .. } => Err(why),
     }
 }

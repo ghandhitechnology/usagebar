@@ -121,13 +121,6 @@ impl AccountRef {
             hidden: false,
         }
     }
-
-    /// What the panel title shows after the provider name.
-    pub fn display_name(&self, vendor_account: Option<&str>) -> Option<String> {
-        self.label
-            .clone()
-            .or_else(|| vendor_account.map(str::to_string))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,11 +265,6 @@ impl Report {
 
     pub fn fact(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
         self.facts.push(Fact::new(label, value));
-        self
-    }
-
-    pub fn quiet_fact(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
-        self.facts.push(Fact::quiet(label, value));
         self
     }
 
