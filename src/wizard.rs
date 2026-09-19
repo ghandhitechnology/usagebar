@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
@@ -42,7 +42,7 @@ pub struct Wizard {
     pub connect: Option<Connect>,
     pub note: Option<String>,
     pub verifying: bool,
-    verify_rx: Option<Receiver<Result<(Report, Credential), String>>>,
+    verify_rx: Option<Receiver<Result<Report, String>>>,
     pub sort: SortMode,
 }
 
@@ -59,9 +59,6 @@ pub struct Connect {
     pub focus: usize,
     /// The vendor's answer after a successful check.
     pub verified: Option<String>,
-    /// The credential the check actually used: Claude rotates its pair while checking,
-    /// and that rotated pair is the one worth keeping.
-    pub rotated: Option<Credential>,
     pub error: Option<String>,
 }
 
@@ -116,7 +113,7 @@ impl Wizard {
             return;
         };
         match rx.try_recv() {
-            Ok(Ok((report, credential))) => {
+            Ok(Ok(report)) => {
                 self.verifying = false;
                 self.verify_rx = None;
                 let who = report.account.clone().or_else(|| report.label.clone());
@@ -131,7 +128,6 @@ impl Wizard {
                 if let Some(connect) = self.connect.as_mut() {
                     connect.verified = Some(summary.clone());
                     connect.error = None;
-                    connect.rotated = Some(credential);
                     // A blank name field takes the vendor's own account name.
                     if let Some(label) = connect.fields.last_mut().filter(|f| f.input.is_blank()) {
                         if let Some(account) = &report.account {
@@ -300,7 +296,6 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
                     // credential does.
                     if connect.focus + 1 < connect.fields.len() {
                         connect.verified = None;
-                        connect.rotated = None;
                     }
                     connect.error = None;
                 }
@@ -341,11 +336,9 @@ fn save_connect(wizard: &mut Wizard, app: &mut App) -> Action {
         let Some(connect) = wizard.connect.as_ref() else {
             return Action::Keep;
         };
-        let Ok((built, origin)) = connect.build(connect.provider) else {
+        let Ok((credential, origin)) = connect.build(connect.provider) else {
             return Action::Keep;
         };
-        // A checked Claude pair may have been rotated by the check itself.
-        let credential = connect.rotated.clone().unwrap_or(built);
         let label = connect
             .fields
             .last()
@@ -365,12 +358,24 @@ fn save_connect(wizard: &mut Wizard, app: &mut App) -> Action {
     };
 
     let existing = find_existing(wizard, app, provider, &credential, origin.as_deref());
-    let id = existing.unwrap_or_else(|| app.config.next_id(provider));
+    // Ids are allocated against the config and the connections made so far in this same
+    // session, or two accounts of one provider would collide and replace each other.
+    let id = existing.unwrap_or_else(|| {
+        let taken: Vec<&str> = app
+            .config
+            .accounts
+            .iter()
+            .map(|account| account.id.as_str())
+            .chain(wizard.pending.iter().map(|pending| pending.account.id.as_str()))
+            .collect();
+        crate::config::free_id(provider, taken.into_iter())
+    });
     let account = AccountRef {
         id,
         provider,
         label,
         hidden: false,
+        problem: None,
     };
     let pending = Pending {
         account,
@@ -446,7 +451,14 @@ pub fn finish(wizard: &mut Wizard, app: &mut App) -> Result<(), String> {
         if same_origin || same_secret {
             continue;
         }
-        let id = app.config.next_id(entry.provider);
+        let taken: Vec<&str> = app
+            .config
+            .accounts
+            .iter()
+            .map(|account| account.id.as_str())
+            .chain(wizard.pending.iter().map(|pending| pending.account.id.as_str()))
+            .collect();
+        let id = crate::config::free_id(entry.provider, taken.into_iter());
         let mut account = AccountRef::new(id.clone(), entry.provider);
         if entry.provider == ProviderId::OpenCodeGo && go_total > 1 {
             go_count += 1;
@@ -456,7 +468,7 @@ pub fn finish(wizard: &mut Wizard, app: &mut App) -> Result<(), String> {
         app.file_store.put(
             &id,
             StoredCredential::new(credential.clone()).with_origin(entry.origin.clone()),
-        );
+        )?;
     }
     for pending in &wizard.pending {
         // Pasting a secret that matches what came from a vendor file keeps the file
@@ -472,7 +484,7 @@ pub fn finish(wizard: &mut Wizard, app: &mut App) -> Result<(), String> {
         app.file_store.put(
             &pending.account.id,
             StoredCredential::new(pending.credential.clone()).with_origin(origin),
-        );
+        )?;
         match app
             .config
             .accounts
@@ -491,7 +503,12 @@ pub fn finish(wizard: &mut Wizard, app: &mut App) -> Result<(), String> {
         }
     }
     app.config.sort = wizard.sort;
-    app.config.interval_secs = app.interval_secs;
+    if !app.interval_locked {
+        app.config.interval_secs = app.interval_secs;
+    }
+    // Finishing with a list means the list is the source of truth; finishing with
+    // nothing selected is the same as skipping, so keep scanning each run.
+    app.config.detect = Some(app.config.accounts.is_empty());
     app.accounts = app.config.accounts.clone();
     app.store =
         std::sync::Arc::clone(&app.file_store) as std::sync::Arc<dyn crate::credentials::CredentialStore>;
@@ -596,7 +613,6 @@ impl Connect {
             fields,
             focus: 0,
             verified: None,
-            rotated: None,
             error: None,
         }
     }
@@ -642,7 +658,7 @@ impl Connect {
             }
             _ => {
                 let token = field(1);
-                (!token.is_empty()).then(|| Credential::Token { token })
+                (!token.is_empty()).then_some(Credential::Token { token })
             }
         };
         if let Some(credential) = pasted {
@@ -683,7 +699,7 @@ pub fn draw(frame: &mut Frame, app: &App, wizard: &Wizard, area: Rect) {
         Step::Done => wizard.total() + 8,
     };
     let height = (rows as u16).min(area.height.saturating_sub(2));
-    let box_area = centered(area, width, height);
+    let box_area = ui::centered(area, width, height);
     let title = match wizard.step {
         Step::Welcome if !wizard.first_run => " Connect an account ",
         Step::Welcome => " Set up usagebar ",
@@ -835,7 +851,7 @@ fn welcome_lines(wizard: &Wizard, inner: Rect, lines: &mut Vec<Line>) {
                         pending.account.provider.display(),
                         pending.account.label.clone().unwrap_or_default()
                     ),
-                    width.saturating_sub(14) as usize,
+                    width.saturating_sub(14),
                 ),
                 Style::default().fg(TEXT),
             ),
@@ -1022,23 +1038,10 @@ fn done_lines(wizard: &Wizard, app: &App, inner: Rect, lines: &mut Vec<Line>) {
     let _ = inner;
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .flex(Flex::Center)
-        .constraints([Constraint::Length(height)])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .flex(Flex::Center)
-        .constraints([Constraint::Length(width)])
-        .split(vertical[0])[0]
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::credentials::FileStore;
 
     fn account(id: &str, provider: ProviderId) -> AccountRef {
@@ -1051,6 +1054,7 @@ mod tests {
             60,
             Arc::new(FileStore::load(dir.join("credentials.json"))),
             SortMode::Manual,
+            Arc::new(FileStore::load(dir.join("credentials.json"))),
         );
         app.config_path = crate::config::config_path(dir);
         app.file_store = Arc::new(FileStore::load(dir.join("credentials.json")));
@@ -1144,12 +1148,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut app = app_with(&dir);
         app.config.accounts = vec![account("claude", ProviderId::Claude)];
-        app.file_store.put(
-            "claude",
-            StoredCredential::new(Credential::Token {
-                token: "old".into(),
-            }),
-        );
+        app.file_store
+            .put(
+                "claude",
+                StoredCredential::new(Credential::Token {
+                    token: "old".into(),
+                }),
+            )
+            .unwrap();
         let mut wizard = Wizard::new(vec![], SortMode::Manual);
         wizard.pending.push(Pending {
             account: account("codex", ProviderId::Codex),

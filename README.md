@@ -9,18 +9,79 @@ instead of inventing a figure.
 
 ## What it reads
 
-| Provider | Source | Auth |
+| Provider | Source | Credential |
 | --- | --- | --- |
-| Claude | `GET api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | `~/.claude/.credentials.json`, refreshed in place when expired |
+| Claude | `GET api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | OAuth pair from `~/.claude/.credentials.json`, refreshed and written back in place |
 | Codex | `GET chatgpt.com/backend-api/wham/usage`; falls back to the last `rate_limits` snapshot in `~/.codex/sessions` | `~/.codex/auth.json` |
-| OpenCode Go | `GET opencode.ai/zen/go/v1/usage` per live key | `credential` table in `~/.local/share/opencode/opencode.db` |
+| OpenCode Go | `GET opencode.ai/zen/go/v1/usage` per key | `credential` table in `~/.local/share/opencode/opencode.db` |
 | Cursor | `GET cursor.com/api/usage-summary` | `~/.cursor/auth.json`, cookie built as `sub::jwt` |
 | Grok | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` | `~/.grok/auth.json` |
 | Devin | `POST server.codeium.com/.../GetUserStatus` (Connect RPC), remaining flipped to used | `windsurf_api_key` in `~/.local/share/devin/credentials.toml` |
 | Command Code | `GET api.commandcode.ai/alpha/billing/credits` | `~/.commandcode/auth.json` |
 
-Providers without credentials are simply absent. A provider that fails keeps its own error
-text on its panel.
+Vendor paths follow the vendor's own environment overrides (`CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, and so on). Secrets live in `~/.config/usagebar/credentials.json`, written
+0600. The config file never holds one.
+
+## Setup
+
+The first run scans the machine and opens with what it found. `space` toggles a credential,
+`a` connects a provider by hand, enter goes to the finish screen.
+
+Connecting by hand takes a file path or a pasted secret. Every manual connection is checked
+against the vendor before it saves, and a check that fails can still be saved with a second
+enter, which is what to do when a vendor is rate limiting rather than wrong. A check only
+reads: it never refreshes or rewrites a credential, so walking away from one costs nothing.
+
+Nothing is written until the finish screen. Esc skips setup and records that choice as
+`"detect": true` with an empty account list, which means "keep scanning each run"; removing
+every account later writes `"detect": false`, so an empty list is a choice, not a reset.
+
+`s` opens the same screens later to add another account.
+
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `q` | quit |
+| `r` | refresh now |
+| `space` | pause |
+| `s` | setup: accounts, order, sort mode, interval |
+| `d` | details for one account, `←` `→` to walk accounts |
+
+## Accounts and order
+
+One account is one panel. Two Claude logins, or two OpenCode Go keys, are two panels with
+their own readings and history.
+
+`s` lists accounts in display order:
+
+| Key | Action |
+| --- | --- |
+| `space` | show or hide the account |
+| `shift+↑` `shift+↓` | move it |
+| `x` | remove it, twice, because that forgets its credentials |
+| `enter` | on a setting, change it |
+
+Sort is `manual`, which is the list order, or `smart`, which is worst first. Interval is any
+number of seconds, five or more. Changes save to `~/.config/usagebar/config.json` as you
+make them:
+
+```json
+{
+  "version": 1,
+  "interval_secs": 60,
+  "sort": "manual",
+  "detect": false,
+  "accounts": [
+    { "id": "claude", "provider": "claude", "label": "work" },
+    { "id": "codex", "provider": "codex", "hidden": true }
+  ]
+}
+```
+
+`USAGEBAR_CONFIG_DIR` moves both files somewhere else. With no accounts configured, every
+run scans the vendor files, which is what the tool did before accounts existed.
 
 ## Install
 
@@ -42,10 +103,8 @@ usge --once         # one snapshot as text
 cargo run --release              # TUI, refreshes every 60s
 cargo run --release -- --once    # one snapshot as text
 cargo run --release -- --json    # one snapshot as JSON
-cargo run --release -- --interval 15
+cargo run --release -- --interval 15   # overrides the saved interval for this run
 ```
-
-Keys: `q` quit, `r` refresh now, `space` pause.
 
 ### In a tmux pane
 
@@ -74,6 +133,11 @@ usagebar --render --sizes 80x24,140x45    # draw frames to stdout, ANSI and all
 
 ## Notes
 
+`d` opens everything one account reported: each window with its exact reset time, then the
+flat vendor numbers. For Codex that includes the credit balance, banked reset credits and
+per-model availability; for the others, whatever the response carried that a panel had no
+room for.
+
 The sparkline under each percentage is this tool's own readings over time, drawn on an
 absolute 0-100 scale. It is the only value not sent by a vendor, and it is labelled by
 construction: a flat line at 90% looks nothing like one at 5%.
@@ -82,8 +146,13 @@ When a poll fails, the panel keeps the last good reading and marks it `stale` wi
 instead of blanking out. Panels only read `unavailable` when there is no previous number to
 stand on.
 
+Claude rotates its refresh token. usagebar writes a rotated pair back to the file it read it
+from when that file still holds the pair it rotated from, and it re-reads the file before
+every poll, so a login refreshed by Claude Code itself is picked up rather than shadowed.
+
 Provider endpoints are undocumented and rate limited, so keep the interval at a minute or
 more. Polling Claude's usage endpoint every few seconds earns a 429.
 
-`--json` is the integration surface; the schema is `{captured_at, reports[]}` with a
-`health.state` of `ok`, `stale`, `no_quota`, or `unavailable` per provider.
+`--json` is the integration surface; the schema is `{captured_at, reports[]}` with
+`account_id`, `label`, `facts[]`, and a `health.state` of `ok`, `stale`, `no_quota`, or
+`unavailable` per account.

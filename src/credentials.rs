@@ -66,8 +66,8 @@ impl StoredCredential {
 
 pub trait CredentialStore: Send + Sync {
     fn get(&self, account_id: &str) -> Option<StoredCredential>;
-    fn put(&self, account_id: &str, credential: StoredCredential);
-    fn remove(&self, account_id: &str);
+    fn put(&self, account_id: &str, credential: StoredCredential) -> Result<(), String>;
+    fn remove(&self, account_id: &str) -> Result<(), String>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -92,14 +92,29 @@ pub struct FileStore {
 impl FileStore {
     pub fn load(path: PathBuf) -> Self {
         let doc = match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                eprintln!("usagebar: {} is unreadable ({e}); starting with no credentials", path.display());
-                StoreDoc::default()
-            }),
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    // Refusing to start empty would be worse, but overwriting a file we
+                    // could not read would silently drop every other account's secret.
+                    let aside = fsutil::set_aside(&path, "corrupt");
+                    eprintln!(
+                        "usagebar: {} did not parse ({e}); moved to {}",
+                        path.display(),
+                        aside
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "a backup".into())
+                    );
+                    StoreDoc::default()
+                }
+            },
             Err(_) => StoreDoc::default(),
         };
         if path.exists() && !fsutil::is_private(&path) {
-            eprintln!("usagebar: {} was readable by other users; setting mode 0600", path.display());
+            eprintln!(
+                "usagebar: {} was readable by other users; setting mode 0600",
+                path.display()
+            );
             let _ = fsutil::set_mode(&path, 0o600);
         }
         Self {
@@ -108,10 +123,12 @@ impl FileStore {
         }
     }
 
-    fn flush(&self, doc: &StoreDoc) -> Result<(), String> {
+    /// Serialize and write while the caller still holds the lock, so two writers cannot
+    /// land on disk out of order and drop one of the credentials.
+    fn flush_locked(doc: &StoreDoc) -> Result<String, String> {
         let mut body = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?;
         body.push('\n');
-        fsutil::write_atomic(&self.path, body.as_bytes(), Some(0o600))
+        Ok(body)
     }
 }
 
@@ -120,32 +137,20 @@ impl CredentialStore for FileStore {
         self.doc.lock().unwrap().credentials.get(account_id).cloned()
     }
 
-    fn put(&self, account_id: &str, credential: StoredCredential) {
-        let snapshot = {
-            let mut doc = self.doc.lock().unwrap();
-            doc.credentials.insert(account_id.to_string(), credential);
-            StoreDoc {
-                version: doc.version,
-                credentials: doc.credentials.clone(),
-            }
-        };
-        if let Err(why) = self.flush(&snapshot) {
-            eprintln!("usagebar: could not save credentials: {why}");
-        }
+    fn put(&self, account_id: &str, credential: StoredCredential) -> Result<(), String> {
+        // The lock is held across the write: two accounts rotating in one poll must not
+        // land on disk out of order, and the in-memory copy is what the next write reads.
+        let mut doc = self.doc.lock().unwrap();
+        doc.credentials.insert(account_id.to_string(), credential);
+        let body = Self::flush_locked(&doc)?;
+        fsutil::write_atomic(&self.path, body.as_bytes(), Some(0o600))
     }
 
-    fn remove(&self, account_id: &str) {
-        let snapshot = {
-            let mut doc = self.doc.lock().unwrap();
-            doc.credentials.remove(account_id);
-            StoreDoc {
-                version: doc.version,
-                credentials: doc.credentials.clone(),
-            }
-        };
-        if let Err(why) = self.flush(&snapshot) {
-            eprintln!("usagebar: could not save credentials: {why}");
-        }
+    fn remove(&self, account_id: &str) -> Result<(), String> {
+        let mut doc = self.doc.lock().unwrap();
+        doc.credentials.remove(account_id);
+        let body = Self::flush_locked(&doc)?;
+        fsutil::write_atomic(&self.path, body.as_bytes(), Some(0o600))
     }
 }
 
@@ -167,16 +172,18 @@ impl CredentialStore for MemoryStore {
         self.doc.lock().unwrap().credentials.get(account_id).cloned()
     }
 
-    fn put(&self, account_id: &str, credential: StoredCredential) {
+    fn put(&self, account_id: &str, credential: StoredCredential) -> Result<(), String> {
         self.doc
             .lock()
             .unwrap()
             .credentials
             .insert(account_id.to_string(), credential);
+        Ok(())
     }
 
-    fn remove(&self, account_id: &str) {
+    fn remove(&self, account_id: &str) -> Result<(), String> {
         self.doc.lock().unwrap().credentials.remove(account_id);
+        Ok(())
     }
 }
 
@@ -185,21 +192,21 @@ impl CredentialStore for MemoryStore {
 pub fn vendor_file(provider: ProviderId) -> Option<PathBuf> {
     match provider {
         ProviderId::Claude => Some(
-            fsutil::dir_from("CLAUDE_CONFIG_DIR", None, ".claude").join(".credentials.json"),
+            fsutil::dir_from("CLAUDE_CONFIG_DIR", ".claude").join(".credentials.json"),
         ),
-        ProviderId::Codex => Some(fsutil::dir_from("CODEX_HOME", None, ".codex").join("auth.json")),
+        ProviderId::Codex => Some(fsutil::dir_from("CODEX_HOME", ".codex").join("auth.json")),
         ProviderId::OpenCodeGo => None,
         ProviderId::Cursor => {
-            Some(fsutil::dir_from("CURSOR_CONFIG_DIR", None, ".cursor").join("auth.json"))
+            Some(fsutil::dir_from("CURSOR_CONFIG_DIR", ".cursor").join("auth.json"))
         }
-        ProviderId::Grok => Some(fsutil::dir_from("GROK_HOME", None, ".grok").join("auth.json")),
+        ProviderId::Grok => Some(fsutil::dir_from("GROK_HOME", ".grok").join("auth.json")),
         ProviderId::Devin => Some(
-            fsutil::dir_from("XDG_DATA_HOME", None, ".local/share")
-                .join("devin/credentials.toml"),
+            fsutil::xdg_dir("XDG_DATA_HOME", "devin", ".local/share/devin")
+                .join("credentials.toml"),
         ),
-        ProviderId::CommandCode => Some(
-            fsutil::dir_from("COMMANDCODE_HOME", None, ".commandcode").join("auth.json"),
-        ),
+        ProviderId::CommandCode => {
+            Some(fsutil::dir_from("COMMANDCODE_HOME", ".commandcode").join("auth.json"))
+        }
     }
 }
 
@@ -266,7 +273,9 @@ pub fn from_vendor_file(provider: ProviderId, path: &Path) -> Option<Credential>
     }
 }
 
-fn origin_is_newer(origin: &Path, stored: &StoredCredential) -> bool {
+/// True when a vendor file may hold something newer than our copy. Content decides;
+/// this only rules out a file that is clearly older than what we wrote.
+fn origin_may_win(origin: &Path, stored: &StoredCredential) -> bool {
     let Ok(modified) = std::fs::metadata(origin).and_then(|meta| meta.modified()) else {
         return false;
     };
@@ -275,8 +284,9 @@ fn origin_is_newer(origin: &Path, stored: &StoredCredential) -> bool {
     };
     let modified = DateTime::<Utc>::from_timestamp(since_epoch.as_secs() as i64, 0)
         .unwrap_or(stored.updated_at);
-    // The one-second slack keeps a mirrored write from looking like someone else's.
-    modified > stored.updated_at + chrono::Duration::seconds(1)
+    // A file written at the same second as ours is the case that matters most: the
+    // vendor just refreshed, and a strict comparison would keep the older copy.
+    modified >= stored.updated_at - chrono::Duration::seconds(1)
 }
 
 /// The credential to use for an account right now. When the vendor file we imported
@@ -290,12 +300,12 @@ pub fn current(account: &AccountRef, store: &dyn CredentialStore) -> Result<Stor
         )
     })?;
     if let Some(origin) = stored.origin.clone() {
-        if origin_is_newer(&origin, &stored) {
+        if origin_may_win(&origin, &stored) {
             if let Some(secret) = from_vendor_file(account.provider, &origin) {
                 if secret != stored.secret {
                     stored.secret = secret;
                     stored.updated_at = Utc::now();
-                    store.put(&account.id, stored.clone());
+                    store.put(&account.id, stored.clone())?;
                 }
             }
         }
@@ -310,22 +320,22 @@ pub fn record(
     store: &dyn CredentialStore,
     previous: &StoredCredential,
     secret: Credential,
-) -> StoredCredential {
+) -> Result<StoredCredential, String> {
     let next = StoredCredential {
         secret,
         origin: previous.origin.clone(),
         updated_at: Utc::now(),
     };
-    store.put(&account.id, next.clone());
+    store.put(&account.id, next.clone())?;
     if let (Some(origin), Credential::ClaudeOauth { refresh_token, .. }) =
         (previous.origin.as_ref(), &previous.secret)
     {
         if let Err(why) = mirror_claude(origin, refresh_token, &next.secret) {
-            // Serving the token still beats failing; the next poll retries the write.
+            // The next rotation tries again; the token we hold is still the one that works.
             eprintln!("usagebar: could not update {}: {why}", origin.display());
         }
     }
-    next
+    Ok(next)
 }
 
 /// Update the vendor file with a rotated pair, but only when it still holds the pair
@@ -446,7 +456,7 @@ mod tests {
         })
         .with_origin(Some(path.clone()));
         stored.updated_at = Utc::now() - chrono::Duration::hours(1);
-        store.put("cursor", stored);
+        store.put("cursor", stored).unwrap();
 
         std::fs::write(&path, r#"{"accessToken":"new"}"#).unwrap();
         let effective = current(&account, &store).unwrap();
@@ -466,22 +476,102 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The vendor CLI can refresh in the same second we mirror a rotation; its copy
+    /// still has to win, so the comparison cannot be a strict one.
+    #[test]
+    fn same_second_vendor_write_is_adopted() {
+        let dir = std::env::temp_dir().join(format!("usagebar-creds5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(&path, r#"{"accessToken":"ours"}"#).unwrap();
+        let store = MemoryStore::new();
+        let account = AccountRef::new("cursor", ProviderId::Cursor);
+        store
+            .put(
+                "cursor",
+                StoredCredential::new(Credential::Token {
+                    token: "ours".into(),
+                })
+                .with_origin(Some(path.clone())),
+            )
+            .unwrap();
+        std::fs::write(&path, r#"{"accessToken":"theirs"}"#).unwrap();
+        let effective = current(&account, &store).unwrap();
+        assert_eq!(
+            effective.secret,
+            Credential::Token {
+                token: "theirs".into()
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn files_are_written_owner_only() {
         let dir = std::env::temp_dir().join(format!("usagebar-creds4-{}", std::process::id()));
         let path = dir.join("credentials.json");
         let store = FileStore::load(path.clone());
-        store.put(
-            "claude",
-            StoredCredential::new(Credential::Token {
-                token: "t".into(),
-            }),
-        );
+        store
+            .put(
+                "claude",
+                StoredCredential::new(Credential::Token {
+                    token: "t".into(),
+                }),
+            )
+            .unwrap();
         assert!(fsutil::is_private(&path));
         let reloaded = FileStore::load(path.clone());
         assert!(reloaded.get("claude").is_some());
-        store.remove("claude");
+        store.remove("claude").unwrap();
         assert!(FileStore::load(path).get("claude").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two fetch threads can rotate two accounts at once; neither write may be lost.
+    #[test]
+    fn concurrent_writes_keep_every_credential() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("usagebar-creds6-{}", std::process::id()));
+        let path = dir.join("credentials.json");
+        let store = Arc::new(FileStore::load(path.clone()));
+        let mut handles = Vec::new();
+        for n in 0..8 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                store
+                    .put(
+                        &format!("account-{n}"),
+                        StoredCredential::new(Credential::Token {
+                            token: format!("token-{n}"),
+                        }),
+                    )
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let reloaded = FileStore::load(path);
+        for n in 0..8 {
+            assert!(
+                reloaded.get(&format!("account-{n}")).is_some(),
+                "account-{n} was dropped by a concurrent write"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable store is moved aside rather than silently replaced by an empty one.
+    #[test]
+    fn corrupt_store_is_set_aside() {
+        let dir = std::env::temp_dir().join(format!("usagebar-creds7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let store = FileStore::load(path.clone());
+        assert!(store.get("anything").is_none());
+        assert!(!path.exists(), "the unreadable file was left in place");
+        assert!(dir.join("credentials.corrupt").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

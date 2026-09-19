@@ -106,6 +106,10 @@ pub struct AccountRef {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// Why a scan could not read this account's vendor file. Runtime only: a configured
+    /// account either has a credential or reports that it is missing one.
+    #[serde(skip)]
+    pub problem: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -119,7 +123,13 @@ impl AccountRef {
             provider,
             label: None,
             hidden: false,
+            problem: None,
         }
+    }
+
+    pub fn problem(mut self, problem: impl Into<String>) -> Self {
+        self.problem = Some(problem.into());
+        self
     }
 }
 

@@ -28,6 +28,9 @@ pub struct App {
     pub refreshing: bool,
     pub paused: bool,
     pub interval_secs: u64,
+    /// True when --interval named a value for this run only; finishing setup must not
+    /// turn that into the saved preference.
+    pub interval_locked: bool,
     /// Accounts in display order, and the secrets they read from.
     pub accounts: Vec<AccountRef>,
     pub store: Arc<dyn CredentialStore>,
@@ -105,8 +108,12 @@ pub enum OverlayAction {
 }
 
 impl App {
-    pub fn new(interval_secs: u64, store: Arc<dyn CredentialStore>, sort: SortMode) -> Self {
-        let dir = config::dir();
+    pub fn new(
+        interval_secs: u64,
+        store: Arc<dyn CredentialStore>,
+        sort: SortMode,
+        file_store: Arc<FileStore>,
+    ) -> Self {
         Self {
             reports: Vec::new(),
             history: HashMap::new(),
@@ -114,6 +121,7 @@ impl App {
             refreshing: false,
             paused: false,
             interval_secs,
+            interval_locked: false,
             accounts: Vec::new(),
             store,
             config: Config {
@@ -121,9 +129,9 @@ impl App {
                 sort,
                 ..Config::default()
             },
-            config_path: config::config_path(&dir),
+            config_path: config::config_path(&config::dir()),
             persisted: false,
-            file_store: Arc::new(FileStore::load(config::credentials_path(&dir))),
+            file_store,
             detected_store: None,
             boot_note: None,
             overlay: None,
@@ -147,6 +155,8 @@ impl App {
     pub fn save_accounts(&mut self, accounts: Vec<AccountRef>) -> Option<String> {
         self.accounts = accounts;
         self.config.accounts = self.accounts.clone();
+        // Once the list is the user's, stop scanning for new credentials each run.
+        self.config.detect = Some(false);
         for account in &self.accounts {
             if self.file_store.get(&account.id).is_none() {
                 if let Some(stored) = self
@@ -154,7 +164,9 @@ impl App {
                     .as_ref()
                     .and_then(|store| store.get(&account.id))
                 {
-                    self.file_store.put(&account.id, stored);
+                    if let Err(why) = self.file_store.put(&account.id, stored) {
+                        return Some(why);
+                    }
                 }
             }
         }
@@ -163,7 +175,9 @@ impl App {
     }
 
     pub fn forget_credentials(&self, account_id: &str) {
-        self.file_store.remove(account_id);
+        if let Err(why) = self.file_store.remove(account_id) {
+            eprintln!("usagebar: could not remove credentials for {account_id}: {why}");
+        }
     }
 
     pub fn absorb(&mut self, reports: Vec<Report>) {
@@ -173,9 +187,18 @@ impl App {
             .map(|report| (report.key.clone(), report.clone()))
             .collect();
         let last_good = self.last_refresh.unwrap_or_else(Instant::now);
+        // A fetch started before the account list changed can still be in flight; its
+        // readings are for accounts the user just hid or removed.
+        let expected: Vec<&str> = self
+            .accounts
+            .iter()
+            .filter(|account| !account.hidden)
+            .map(|account| account.id.as_str())
+            .collect();
 
         let reports: Vec<Report> = reports
             .into_iter()
+            .filter(|report| expected.contains(&report.key.as_str()))
             .map(|mut report| {
                 // A rate limit or a network blip should not erase a panel that had a real
                 // vendor number a moment ago; keep the number and say how old it is.
@@ -338,6 +361,20 @@ pub(crate) fn pad(text: &str, width: usize) -> String {
     let clipped = clip(text, width);
     let len = clipped.chars().count();
     format!("{clipped}{}", " ".repeat(width.saturating_sub(len)))
+}
+
+/// A box of a fixed size, centered in the given area. Used by every overlay.
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .flex(ratatui::layout::Flex::Center)
+        .constraints([Constraint::Length(height)])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .flex(ratatui::layout::Flex::Center)
+        .constraints([Constraint::Length(width)])
+        .split(vertical[0])[0]
 }
 
 // ------------------------------------------------------------------ draw
@@ -609,13 +646,15 @@ fn card_height(report: &Report, density: Density) -> u16 {
         Density::Full => 2,
         _ => 1,
     };
+    let summary = usize::from(
+        !report.notes.is_empty() || report.facts.iter().any(|fact| fact.panel),
+    );
     let content = match &report.health {
         Health::Unavailable(_) => 2,
-        Health::Stale { .. } => report.windows.len() * per_window + 1,
-        Health::Ok | Health::NoQuota(_) => {
-            report.windows.len() * per_window
-                + usize::from(!report.notes.is_empty() || report.facts.iter().any(|f| f.panel))
-        }
+        // Stale keeps the windows and the summary from the last good reading and adds
+        // one line saying why it is old.
+        Health::Stale { .. } => report.windows.len() * per_window + 1 + summary,
+        Health::Ok | Health::NoQuota(_) => report.windows.len() * per_window + summary,
     };
     (content + 2) as u16
 }
@@ -888,7 +927,13 @@ mod tests {
     use chrono::TimeZone;
 
     fn test_app() -> App {
-        App::new(60, Arc::new(MemoryStore::new()), SortMode::Manual)
+        let dir = std::env::temp_dir().join(format!("usagebar-ui-{}", std::process::id()));
+        App::new(
+            60,
+            Arc::new(MemoryStore::new()),
+            SortMode::Manual,
+            Arc::new(crate::credentials::FileStore::load(dir.join("credentials.json"))),
+        )
     }
 
     /// A failed poll must keep the previous vendor number, marked stale, rather than
@@ -896,6 +941,7 @@ mod tests {
     #[test]
     fn failure_keeps_last_good_reading() {
         let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
         let mut good = Report::new(ProviderId::Claude).key("claude");
         good.windows.push(Window::new("Weekly", 42.0));
         app.absorb(vec![good]);
@@ -915,6 +961,10 @@ mod tests {
     #[test]
     fn accounts_of_one_provider_keep_separate_histories() {
         let mut app = test_app();
+        app.accounts = vec![
+            AccountRef::new("claude-a", ProviderId::Claude),
+            AccountRef::new("claude-b", ProviderId::Claude),
+        ];
         let mut first = Report::new(ProviderId::Claude).key("claude-a");
         first.windows.push(Window::new("Weekly", 10.0));
         let mut second = Report::new(ProviderId::Claude).key("claude-b");
@@ -929,6 +979,7 @@ mod tests {
     #[test]
     fn failure_without_history_stays_unavailable() {
         let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
         app.absorb(vec![Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")]);
         assert!(matches!(app.reports[0].health, Health::Unavailable(_)));
         assert!(app.reports[0].windows.is_empty());

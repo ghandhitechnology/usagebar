@@ -164,10 +164,24 @@ pub fn detect() -> Vec<Detected> {
     found
 }
 
+/// The OpenCode Go keys live in the OpenCode database, not in a vendor auth file.
+fn opencode_db() -> PathBuf {
+    if let Ok(dir) = std::env::var("OPENCODE_DATA_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("opencode.db");
+        }
+    }
+    fsutil::xdg_dir("XDG_DATA_HOME", "opencode", ".local/share/opencode").join("opencode.db")
+}
+
 /// The OpenCode store holds keys for several services, so a key counts as a Go
 /// credential only when the Go endpoint answers for it.
 fn detect_opencode_go() -> Vec<Detected> {
-    let db = fsutil::dir_from("OPENCODE_DATA_DIR", None, ".local/share/opencode").join("opencode.db");
+    let db = opencode_db();
+    if !db.exists() {
+        // OpenCode is not installed; that is not an error worth showing.
+        return Vec::new();
+    }
     let mut found = Vec::new();
     let mut errors = Vec::new();
     match opencode_keys(&db) {
@@ -346,7 +360,7 @@ fn rotate_claude(
         .and_then(Value::as_str)
         .unwrap_or(refresh_token);
     let expires_in = f(&body, "expires_in").unwrap_or(3600.0) as i64;
-    Ok(credentials::record(
+    credentials::record(
         account,
         store,
         stored,
@@ -356,12 +370,12 @@ fn rotate_claude(
             expires_at: now + expires_in * 1000,
             subscription_type: subscription_type.clone(),
         },
-    ))
+    )
 }
 
 // ---------------------------------------------------------------- codex
 
-fn codex(credential: &Credential, origin: Option<&Path>) -> Result<Report> {
+fn codex(credential: &Credential, origin: Option<&Path>, live_only: bool) -> Result<Report> {
     let Credential::CodexTokens {
         access_token,
         account_id,
@@ -373,6 +387,11 @@ fn codex(credential: &Credential, origin: Option<&Path>) -> Result<Report> {
     match codex_live(access_token, account_id.as_deref()) {
         Ok(report) if report.health_is_ok() => Ok(report),
         live => {
+            if live_only {
+                // Checking a credential must prove the token works; the local rollout
+                // says nothing about that.
+                return live;
+            }
             // The newest local rollout is a fallback, not a source: it needs a Codex
             // home directory, which only exists when the credential came from a file.
             let fallback = origin
@@ -963,10 +982,15 @@ fn command_code(credential: &Credential) -> Result<Report> {
 
 // ---------------------------------------------------------------- fan-out
 
-fn dispatch(provider: ProviderId, credential: &Credential, origin: Option<&Path>) -> Result<Report> {
+fn dispatch(
+    provider: ProviderId,
+    credential: &Credential,
+    origin: Option<&Path>,
+    mode: Mode,
+) -> Result<Report> {
     match provider {
         ProviderId::Claude => claude(credential),
-        ProviderId::Codex => codex(credential, origin),
+        ProviderId::Codex => codex(credential, origin, mode == Mode::Check),
         ProviderId::OpenCodeGo => opencode_go(credential),
         ProviderId::Cursor => cursor(credential),
         ProviderId::Grok => grok(credential),
@@ -975,19 +999,36 @@ fn dispatch(provider: ProviderId, credential: &Credential, origin: Option<&Path>
     }
 }
 
+/// How a fetch is allowed to behave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The normal poll: refresh what is stale and persist the rotated credential.
+    Poll,
+    /// Read only. A check must never consume a refresh token or write a vendor file,
+    /// because the user may walk away from it.
+    Check,
+}
+
 /// One account, end to end: resolve the credential, refresh it if the provider does
 /// that here, then read the vendor.
 pub fn fetch_one(account: &AccountRef, store: &dyn CredentialStore) -> Report {
+    fetch_with(account, store, Mode::Poll)
+}
+
+pub fn fetch_with(account: &AccountRef, store: &dyn CredentialStore, mode: Mode) -> Report {
     let failed = |why: String| {
         Report::failed(account.provider, why)
             .key(account.id.clone())
             .label(account.label.clone())
     };
+    if let Some(problem) = &account.problem {
+        return failed(problem.clone());
+    }
     let stored = match credentials::current(account, store) {
         Ok(stored) => stored,
         Err(why) => return failed(why),
     };
-    let stored = if account.provider == ProviderId::Claude {
+    let stored = if account.provider == ProviderId::Claude && mode == Mode::Poll {
         match rotate_claude(account, store, &stored) {
             Ok(stored) => stored,
             Err(why) => return failed(why),
@@ -996,7 +1037,7 @@ pub fn fetch_one(account: &AccountRef, store: &dyn CredentialStore) -> Report {
         stored
     };
     let origin = stored.origin.clone();
-    match dispatch(account.provider, &stored.secret, origin.as_deref()) {
+    match dispatch(account.provider, &stored.secret, origin.as_deref(), mode) {
         Ok(report) => report.key(account.id.clone()).label(account.label.clone()),
         Err(why) => failed(why),
     }
@@ -1013,37 +1054,37 @@ pub fn accounts_from_detected(detected: &[Detected]) -> (Vec<AccountRef>, Memory
         .count();
     let mut go_seen = 0usize;
     for entry in detected {
+        let mut account = AccountRef::new(next_account_id(&accounts, entry.provider), entry.provider);
         let Some(credential) = &entry.credential else {
+            // A file that exists but holds nothing usable still deserves a panel that
+            // says so, instead of the provider quietly disappearing.
+            accounts.push(account.problem(
+                entry
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "no usable credentials".into()),
+            ));
             continue;
         };
-        let mut account = AccountRef::new(next_account_id(&accounts, entry.provider), entry.provider);
         if entry.provider == ProviderId::OpenCodeGo && go_total > 1 {
             // The credential store carries no account names; an ordinal is the only
             // honest label for the second Go key onward.
             go_seen += 1;
             account.label = Some(format!("#{go_seen}"));
         }
-        store.put(
-            &account.id,
-            StoredCredential::new(credential.clone()).with_origin(entry.origin.clone()),
-        );
+        store
+            .put(
+                &account.id,
+                StoredCredential::new(credential.clone()).with_origin(entry.origin.clone()),
+            )
+            .expect("an in-memory store cannot fail");
         accounts.push(account);
     }
     (accounts, store)
 }
 
 fn next_account_id(accounts: &[AccountRef], provider: ProviderId) -> String {
-    let base = provider.slug();
-    if !accounts.iter().any(|account| account.id == base) {
-        return base.to_string();
-    }
-    for n in 2..1000 {
-        let candidate = format!("{base}-{n}");
-        if !accounts.iter().any(|account| account.id == candidate) {
-            return candidate;
-        }
-    }
-    format!("{base}-{}", std::process::id())
+    crate::config::free_id(provider, accounts.iter().map(|account| account.id.as_str()))
 }
 
 /// Every visible account runs on its own thread so one slow vendor cannot hold up the
@@ -1083,28 +1124,18 @@ pub fn fetch_all(
 }
 
 /// Check a credential before the user commits to it. One live call, and the vendor's
-/// own answer decides whether the account is usable. The credential comes back too,
-/// because a provider that refreshes during the call has a new one to keep.
-pub fn verify(
-    provider: ProviderId,
-    credential: &Credential,
-    origin: Option<&Path>,
-) -> Result<(Report, Credential)> {
+/// own answer decides whether the account is usable. Nothing is written: a check must
+/// not rotate a token or touch a vendor file, because the user may walk away from it.
+pub fn verify(provider: ProviderId, credential: &Credential, origin: Option<&Path>) -> Result<Report> {
     let account = AccountRef::new("verify", provider);
     let store = MemoryStore::new();
     store.put(
         "verify",
         StoredCredential::new(credential.clone()).with_origin(origin.map(Path::to_path_buf)),
-    );
-    let report = fetch_one(&account, &store);
+    )?;
+    let report = fetch_with(&account, &store, Mode::Check);
     match report.health {
-        Health::Ok | Health::NoQuota(_) => {
-            let effective = store
-                .get("verify")
-                .map(|stored| stored.secret)
-                .unwrap_or_else(|| credential.clone());
-            Ok((report, effective))
-        }
+        Health::Ok | Health::NoQuota(_) => Ok(report),
         Health::Unavailable(why) | Health::Stale { why, .. } => Err(why),
     }
 }

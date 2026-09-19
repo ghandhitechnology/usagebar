@@ -7,8 +7,6 @@ pub struct TextInput {
     value: String,
     /// Cursor as a character index, not a byte offset: pasted secrets can hold anything.
     cursor: usize,
-    /// First visible character, so a long token can still be edited in a narrow pane.
-    scroll: usize,
     pub masked: bool,
 }
 
@@ -23,7 +21,6 @@ impl TextInput {
         Self {
             value,
             cursor,
-            scroll: 0,
             masked: false,
         }
     }
@@ -45,7 +42,6 @@ impl TextInput {
     pub fn set(&mut self, text: impl Into<String>) {
         self.value = text.into();
         self.cursor = self.value.chars().count();
-        self.scroll = 0;
     }
 
     fn byte_at(&self, char_index: usize) -> usize {
@@ -157,7 +153,7 @@ impl TextInput {
             return (String::new(), 0);
         }
         let chars: Vec<char> = self.value.chars().collect();
-        let mut scroll = self.scroll;
+        let mut scroll = 0;
         if self.cursor < scroll {
             scroll = self.cursor;
         }

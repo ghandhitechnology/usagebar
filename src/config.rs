@@ -30,6 +30,10 @@ pub struct Config {
     pub interval_secs: u64,
     #[serde(default)]
     pub sort: SortMode,
+    /// Explicit auto-detection. Absent (a hand-written or older config) means "scan the
+    /// machine when the account list is empty".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect: Option<bool>,
     /// Display order. Accounts missing from this list are not shown.
     #[serde(default)]
     pub accounts: Vec<AccountRef>,
@@ -49,44 +53,53 @@ impl Default for Config {
             version: CONFIG_VERSION,
             interval_secs: DEFAULT_INTERVAL,
             sort: SortMode::Manual,
+            detect: None,
             accounts: Vec::new(),
         }
     }
 }
 
 impl Config {
-    /// An empty account list means "keep auto-detecting vendor credentials", which is
-    /// both the pre-config behavior and what skipping setup leaves behind.
+    /// Whether this run should scan the machine instead of trusting the account list.
+    /// Skipping setup writes `detect: true`; removing every account writes `false`, so
+    /// the two can be told apart.
     pub fn auto_detect(&self) -> bool {
-        self.accounts.is_empty()
+        self.detect.unwrap_or(self.accounts.is_empty())
     }
 
     pub fn interval(&self) -> u64 {
         self.interval_secs.max(MIN_INTERVAL)
     }
 
-    /// A unique id for a new account, e.g. "claude", then "claude-2".
-    pub fn next_id(&self, provider: crate::model::ProviderId) -> String {
-        let base = provider.slug();
-        if !self.accounts.iter().any(|account| account.id == base) {
-            return base.to_string();
-        }
-        for n in 2..1000 {
-            let candidate = format!("{base}-{n}");
-            if !self.accounts.iter().any(|account| account.id == candidate) {
-                return candidate;
-            }
-        }
-        format!("{base}-{}", std::process::id())
+}
+
+/// The first free id for a provider among everything already taken, config and
+/// in-progress wizard connections alike.
+pub fn free_id<'a>(
+    provider: crate::model::ProviderId,
+    taken: impl Iterator<Item = &'a str>,
+) -> String {
+    let taken: Vec<&str> = taken.collect();
+    let base = provider.slug();
+    if !taken.contains(&base) {
+        return base.to_string();
     }
+    for n in 2..1000 {
+        let candidate = format!("{base}-{n}");
+        if !taken.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!("{base}-{}", std::process::id())
 }
 
 pub fn dir() -> PathBuf {
-    fsutil::dir_from(
-        "USAGEBAR_CONFIG_DIR",
-        Some("XDG_CONFIG_HOME"),
-        ".config/usagebar",
-    )
+    if let Ok(dir) = std::env::var("USAGEBAR_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    fsutil::xdg_dir("XDG_CONFIG_HOME", "usagebar", ".config/usagebar")
 }
 
 pub fn config_path(dir: &Path) -> PathBuf {
@@ -147,7 +160,6 @@ mod tests {
         assert_eq!(loaded.sort, SortMode::Smart);
         assert_eq!(loaded.accounts[0].id, "claude-work");
         assert!(loaded.accounts[1].hidden);
-        assert_eq!(loaded.accounts[1].hidden, true);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -180,12 +192,41 @@ mod tests {
     #[test]
     fn ids_stay_unique_per_provider() {
         let mut config = Config::default();
-        let first = config.next_id(ProviderId::Claude);
+        let first = free_id(ProviderId::Claude, config.accounts.iter().map(|a| a.id.as_str()));
         config
             .accounts
             .push(AccountRef::new(first.clone(), ProviderId::Claude));
-        let second = config.next_id(ProviderId::Claude);
+        let second = free_id(ProviderId::Claude, config.accounts.iter().map(|a| a.id.as_str()));
         assert_eq!(first, "claude");
         assert_eq!(second, "claude-2");
+    }
+
+    /// Two connections of one provider in a single wizard session must not collide.
+    #[test]
+    fn free_id_counts_accounts_that_are_not_in_the_config_yet() {
+        let pending = ["claude", "claude-2"];
+        let third = free_id(ProviderId::Claude, pending.iter().copied());
+        assert_eq!(third, "claude-3");
+    }
+
+    /// Skipping setup and removing every account both leave an empty list, and they
+    /// have to mean different things.
+    #[test]
+    fn detection_is_explicit_when_it_is_written() {
+        let skipped = Config {
+            detect: Some(true),
+            ..Config::default()
+        };
+        assert!(skipped.auto_detect());
+        let emptied = Config {
+            detect: Some(false),
+            ..Config::default()
+        };
+        assert!(!emptied.auto_detect());
+        // A config that never mentions detection falls back to the account list.
+        assert!(Config::default().auto_detect());
+        let hand_written: Config =
+            serde_json::from_str(r#"{"accounts":[{"id":"claude","provider":"claude"}]}"#).unwrap();
+        assert!(!hand_written.auto_detect());
     }
 }

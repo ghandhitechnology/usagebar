@@ -43,21 +43,22 @@ fn main() -> std::io::Result<()> {
     let (config, config_error) = match config::load(&config_path) {
         Ok(Some(config)) => (Some(config), None),
         Ok(None) => (None, None),
-        Err(why) => (
-            None,
-            Some(format!("{why}; starting setup instead of using it")),
-        ),
+        Err(why) => {
+            // The overlay footer is narrow; the full error goes to stderr.
+            eprintln!("usagebar: {why}");
+            (None, Some("config.json is unreadable; setup will start fresh".into()))
+        }
     };
 
-    let interval = arg_value(&args, "--interval")
+    let cli_interval = arg_value(&args, "--interval")
         .and_then(|v| v.parse::<u64>().ok())
-        .map(|secs| secs.max(config::MIN_INTERVAL))
-        .unwrap_or_else(|| {
-            config
-                .as_ref()
-                .map(Config::interval)
-                .unwrap_or(DEFAULT_INTERVAL)
-        });
+        .map(|secs| secs.max(config::MIN_INTERVAL));
+    let interval = cli_interval.unwrap_or_else(|| {
+        config
+            .as_ref()
+            .map(Config::interval)
+            .unwrap_or(DEFAULT_INTERVAL)
+    });
 
     if args.iter().any(|a| a == "--json") {
         let (accounts, store) = boot(&config, &file_store);
@@ -75,7 +76,7 @@ fn main() -> std::io::Result<()> {
             None => vec![(width, height)],
         };
         let (accounts, store) = boot(&config, &file_store);
-        let mut app = App::new(interval, store, sort_mode(&config));
+        let mut app = App::new(interval, store, sort_mode(&config), Arc::clone(&file_store));
         app.accounts = accounts;
         app.absorb(providers::fetch_all(
             &app.accounts,
@@ -93,7 +94,7 @@ fn main() -> std::io::Result<()> {
         print_table(&providers::fetch_all(&accounts, &store, sort_mode(&config)));
         return Ok(());
     }
-    run_tui(interval, config, config_error, file_store)
+    run_tui(interval, config, config_error, file_store, cli_interval.is_some())
 }
 
 fn help() -> String {
@@ -109,7 +110,7 @@ fn help() -> String {
          \x20 --height <ROWS>    frame height for --render (default 24)\n\
          \x20 --sizes <LIST>     several frames at once, e.g. 80x24,140x45\n\
          \x20 -h, --help         show this text\n\n\
-         KEYS: q quit · r refresh · space pause · s setup\n\
+         KEYS: q quit · r refresh · space pause · s setup · d details\n\
          Config: ~/.config/usagebar/config.json (override with USAGEBAR_CONFIG_DIR)\n"
     )
 }
@@ -243,6 +244,7 @@ fn run_tui(
     config: Option<Config>,
     config_error: Option<String>,
     file_store: Arc<FileStore>,
+    interval_locked: bool,
 ) -> std::io::Result<()> {
     // Without a terminal this would panic deep inside ratatui; say what to do instead.
     if !std::io::stdout().is_terminal() {
@@ -263,8 +265,9 @@ fn run_tui(
     } else {
         Arc::new(MemoryStore::new())
     };
-    let mut app = App::new(interval, store, sort_mode(&config));
+    let mut app = App::new(interval, store, sort_mode(&config), Arc::clone(&file_store));
     app.accounts = saved_accounts;
+    app.interval_locked = interval_locked;
     app.config = config.unwrap_or(Config {
         interval_secs: interval,
         sort: SortMode::Smart,
@@ -337,6 +340,22 @@ fn run_tui(
                                 // Closing the first-run wizard without saving still
                                 // records the skip, so it does not open every launch.
                                 if matches!(overlay, Overlay::Wizard(_)) && !app.persisted {
+                                    // A file that exists but did not parse is kept aside
+                                    // rather than overwritten; its accounts may still be
+                                    // recoverable by hand.
+                                    if app.config_path.exists() {
+                                        match crate::fsutil::set_aside(&app.config_path, "unreadable")
+                                        {
+                                            Ok(aside) => eprintln!(
+                                                "usagebar: kept the unreadable config at {}",
+                                                aside.display()
+                                            ),
+                                            Err(why) => eprintln!("usagebar: {why}"),
+                                        }
+                                    }
+                                    // An explicit "keep scanning", so an empty account
+                                    // list stays unambiguous.
+                                    app.config.detect = Some(true);
                                     let _ = app.save_config();
                                 }
                                 app.boot_note = None;

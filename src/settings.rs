@@ -2,7 +2,7 @@
 //! Everything here saves as it is changed; there is no separate apply step.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
@@ -60,8 +60,10 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
                         let secs = secs.max(config::MIN_INTERVAL);
                         app.interval_secs = secs;
                         app.config.interval_secs = secs;
-                        settings.note = app.save_config().map(|why| format!("not saved: {why}"));
-                        settings.note = Some(format!("refreshing every {secs}s"));
+                        settings.note = match app.save_config() {
+                            Some(why) => Some(format!("not saved: {why}")),
+                            None => Some(format!("refreshing every {secs}s")),
+                        };
                     }
                     Err(_) => settings.note = Some(format!("\"{typed}\" is not a number")),
                 }
@@ -83,6 +85,20 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
         return Action::Close;
     }
     settings.selected = settings.selected.min(list.len() - 1);
+
+    // Moving an account: shift with the arrow keys, or J and K for terminals that
+    // swallow the modifier.
+    let moving = match key.code {
+        KeyCode::Char('K') => Some(-1),
+        KeyCode::Char('J') => Some(1),
+        KeyCode::Up if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => Some(-1),
+        KeyCode::Down if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => Some(1),
+        _ => None,
+    };
+    if let (Some(delta), Row::Account(index)) = (moving, list[settings.selected]) {
+        return move_account(settings, app, index, delta);
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('s') => return Action::Close,
         KeyCode::Up => {
@@ -115,12 +131,6 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
                     ),
                 });
                 return Action::Refresh;
-            }
-            KeyCode::Char('K') => {
-                return move_account(settings, app, index, -1);
-            }
-            KeyCode::Char('J') => {
-                return move_account(settings, app, index, 1);
             }
             KeyCode::Char('x') => {
                 return remove_account(settings, app, index);
@@ -192,10 +202,14 @@ fn remove_account(settings: &mut Settings, app: &mut App, index: usize) -> Actio
     let mut accounts = app.accounts.clone();
     accounts.remove(index);
     settings.selected = settings.selected.min(accounts.len().saturating_sub(1));
-    app.forget_credentials(&id);
-    settings.note = app
-        .save_accounts(accounts)
-        .map(|why| format!("not saved: {why}"));
+    // The config first: if that write fails the account is still whole, credentials and all.
+    match app.save_accounts(accounts) {
+        Some(why) => settings.note = Some(format!("not saved: {why}")),
+        None => {
+            app.forget_credentials(&id);
+            settings.note = None;
+        }
+    }
     Action::Refresh
 }
 
@@ -214,8 +228,8 @@ fn account_name(account: &AccountRef) -> String {
 pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
     let list = rows(app);
     let height = (list.len() + 6).min(area.height as usize) as u16;
-    let width = (area.width.saturating_sub(4)).min(76);
-    let box_area = centered(area, width, height);
+    let width = (area.width.saturating_sub(4)).min(80);
+    let box_area = ui::centered(area, width, height);
     let block = Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -302,7 +316,7 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
         )),
         None => Line::from(Span::styled(
             ui::clip(
-                "space show/hide · shift+↑↓ move · x remove · changes save as you make them",
+                "space show/hide · shift+↑↓ move · x remove · saved as you go",
                 inner.width as usize,
             ),
             Style::default().fg(FAINT),
@@ -312,11 +326,11 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
 
     frame.render_widget(Paragraph::new(lines), inner);
     if let Some(input) = &settings.editing {
-        // Put the real cursor in the interval field so typing feels normal.
+        // Put the real cursor in the interval field, which is the last row of the list.
         let (_, column) = input.display(inner.width as usize);
-        let y = inner.y + (list.len() as u16) + 1;
+        let y = inner.y + list.len() as u16 - 1;
         let x = inner.x + 13 + column as u16;
-        frame.set_cursor_position((x.min(inner.x + inner.width - 1), y));
+        frame.set_cursor_position((x.min(inner.x + inner.width - 1), y.min(inner.y + inner.height - 1)));
     }
 }
 
@@ -327,7 +341,7 @@ fn setting_line(selected: bool, name: &str, value: &str) -> Line<'static> {
             Style::default().fg(ACCENT),
         ),
         Span::styled(
-            format!("{}", ui::pad(name, 10)),
+            ui::pad(name, 10),
             Style::default().fg(if selected { TEXT } else { DIM }),
         ),
         Span::styled(
@@ -363,24 +377,10 @@ fn status_of(app: &App, account: &AccountRef) -> (String, ratatui::style::Color)
     }
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .flex(Flex::Center)
-        .constraints([Constraint::Length(height)])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .flex(Flex::Center)
-        .constraints([Constraint::Length(width)])
-        .split(vertical[0]);
-    horizontal[0]
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::credentials::MemoryStore;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -392,6 +392,7 @@ mod tests {
             60,
             Arc::new(MemoryStore::new()),
             SortMode::Manual,
+            Arc::new(crate::credentials::FileStore::load(dir.join("credentials.json"))),
         );
         (app, dir)
     }
@@ -409,8 +410,10 @@ mod tests {
         app.persisted = true;
         app.file_store = Arc::new(crate::credentials::FileStore::load(dir.join("credentials.json")));
 
-        let mut settings = Settings::default();
-        settings.selected = 1;
+        let mut settings = Settings {
+            selected: 1,
+            ..Settings::default()
+        };
         let action = handle(
             &mut settings,
             &mut app,

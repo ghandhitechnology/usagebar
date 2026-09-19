@@ -2,7 +2,7 @@
 //! and the arrow keys walk through the accounts.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
@@ -51,10 +51,8 @@ pub fn handle(detail: &mut Detail, app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Left | KeyCode::Up => {
             detail.index = detail.index.saturating_sub(1);
         }
-        KeyCode::Right | KeyCode::Down => {
-            if !accounts.is_empty() {
-                detail.index = (detail.index + 1).min(accounts.len() - 1);
-            }
+        KeyCode::Right | KeyCode::Down if !accounts.is_empty() => {
+            detail.index = (detail.index + 1).min(accounts.len() - 1);
         }
         _ => {}
     }
@@ -159,7 +157,7 @@ pub fn draw(frame: &mut Frame, app: &App, detail: &Detail, area: Rect) {
 
     let height = (lines.len() + 2)
         .min(area.height.saturating_sub(2) as usize) as u16;
-    let box_area = centered(area, width, height);
+    let box_area = ui::centered(area, width, height);
 
     let name = match &account.label {
         Some(label) => format!("{} · {label}", account.provider.display()),
@@ -202,14 +200,30 @@ pub fn draw(frame: &mut Frame, app: &App, detail: &Detail, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn window_line(window: &crate::model::Window, width: usize, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
-    let bar_width = 24.min(width.saturating_sub(46)).max(6);
-    let mut spans = vec![
-        Span::styled(
-            format!("  {}", ui::pad(&window.label, 16)),
-            Style::default().fg(TEXT),
-        ),
-    ];
+fn window_line(
+    window: &crate::model::Window,
+    width: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Line<'static> {
+    let reset_text = window
+        .resets_at
+        .map(|reset| {
+            format!(
+                "resets {} (in {})",
+                reset.with_timezone(&chrono::Local).format("%b %d %H:%M"),
+                ui::countdown(reset, now)
+            )
+        })
+        .unwrap_or_default();
+    // The bar takes what the label, the percentage and the reset text leave behind.
+    let fixed = 2 + 17 + 1 + 4 + if reset_text.is_empty() { 0 } else { 2 };
+    let bar_width = width
+        .saturating_sub(fixed + reset_text.chars().count())
+        .clamp(6, 24);
+    let mut spans = vec![Span::styled(
+        format!("  {}", ui::pad(&window.label, 16)),
+        Style::default().fg(TEXT),
+    )];
     spans.extend(ui::bar_spans(window.used_percent, bar_width));
     spans.push(Span::styled(
         format!(" {:>3.0}%", window.used_percent),
@@ -217,10 +231,9 @@ fn window_line(window: &crate::model::Window, width: usize, now: chrono::DateTim
             .fg(ui::ramp(window.used_percent, 0.8))
             .add_modifier(Modifier::BOLD),
     ));
-    if let Some(reset) = window.resets_at {
-        let exact = reset.with_timezone(&chrono::Local).format("%b %d %H:%M");
+    if !reset_text.is_empty() {
         spans.push(Span::styled(
-            format!("  resets {exact} (in {})", ui::countdown(reset, now)),
+            format!("  {}", ui::clip(&reset_text, width.saturating_sub(fixed + bar_width))),
             Style::default().fg(DIM),
         ));
     }
@@ -248,18 +261,6 @@ fn health_detail(health: &Health) -> Option<String> {
     }
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .flex(Flex::Center)
-        .constraints([Constraint::Length(height)])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .flex(Flex::Center)
-        .constraints([Constraint::Length(width)])
-        .split(vertical[0])[0]
-}
 
 #[cfg(test)]
 mod tests {
@@ -271,7 +272,13 @@ mod tests {
     use std::sync::Arc;
 
     fn app_with_report(report: Report) -> App {
-        let mut app = App::new(60, Arc::new(MemoryStore::new()), crate::config::SortMode::Manual);
+        let dir = std::env::temp_dir().join(format!("usagebar-detail-{}", std::process::id()));
+        let mut app = App::new(
+            60,
+            Arc::new(MemoryStore::new()),
+            crate::config::SortMode::Manual,
+            Arc::new(crate::credentials::FileStore::load(dir.join("credentials.json"))),
+        );
         app.accounts = vec![AccountRef::new("codex", ProviderId::Codex)];
         app.absorb(vec![report]);
         app
