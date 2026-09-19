@@ -1,0 +1,16 @@
+[package]
+name = "usagebar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
