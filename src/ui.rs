@@ -361,7 +361,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     grid(frame, app, chunks[1]);
     footer(frame, app, chunks[2]);
     if app.overlay.is_some() {
-        backdrop(frame);
+        backdrop(frame, chunks[2]);
     }
     match &app.overlay {
         Some(Overlay::Settings(settings)) => settings::draw(frame, app, settings, area),
@@ -371,11 +371,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Drops everything drawn so far towards the background, so an open overlay reads as
+/// Drops the view behind an open overlay towards the background, so the overlay reads as
 /// the only live surface. Each colour keeps its hue and loses most of its brightness;
-/// bold goes with it, since a bright weight would punch back through the veil.
-fn backdrop(frame: &mut Frame) {
-    for cell in frame.buffer_mut().content.iter_mut() {
+/// bold goes with it, since a bright weight would punch back through the veil. Only the
+/// rows above `footer` are veiled, which keeps the key guide fully readable.
+fn backdrop(frame: &mut Frame, footer: Rect) {
+    let area = frame.area();
+    let veiled = area.width as usize * footer.y.saturating_sub(area.y) as usize;
+    for cell in frame.buffer_mut().content.iter_mut().take(veiled) {
         cell.fg = faded(cell.fg);
         cell.bg = faded(cell.bg);
         cell.modifier.remove(Modifier::BOLD);
@@ -1080,9 +1083,9 @@ mod tests {
         assert_eq!(hidden, 2);
     }
 
-    /// An open overlay drops the view behind it to the backdrop and leaves itself alone.
+    /// An open overlay drops the view behind it, and the key guide stays out of the veil.
     #[test]
-    fn the_setup_overlay_dims_the_view_behind_it() {
+    fn the_setup_overlay_dims_the_view_behind_it_but_not_the_key_guide() {
         let mut app = test_app();
         app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
         app.absorb(vec![sample_report(ProviderId::Claude, 2)]);
@@ -1095,8 +1098,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let veiled = terminal.backend().buffer().clone();
 
-        // The header and footer sit outside the centered panel, so every coloured cell
-        // there keeps its place and loses its brightness.
+        // Everything above the key guide keeps its place and loses its brightness.
         let mut compared = 0;
         for y in [0, 1, 38] {
             for x in 0..120 {
@@ -1109,6 +1111,18 @@ mod tests {
             }
         }
         assert!(compared > 4, "the header should carry colour to compare");
+
+        // The navigation guide on the last row is drawn as-is: its keys keep the accent
+        // colour that everything above has just given up.
+        let guide = 39;
+        let keys = (0..120)
+            .filter(|&x| veiled[(x, guide)].fg == ACCENT)
+            .count();
+        assert!(keys > 0, "the key guide should carry the accent colour");
+        assert!(
+            (0..120).all(|x| veiled[(x, guide)].fg != faded(ACCENT)),
+            "the key guide should stay out of the veil"
+        );
 
         // The panel is drawn after the backdrop, so its accent survives untouched.
         assert!(veiled.content().iter().any(|cell| cell.fg == ACCENT));
