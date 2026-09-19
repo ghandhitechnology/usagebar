@@ -8,6 +8,7 @@ mod providers;
 mod render;
 mod settings;
 mod ui;
+mod usage;
 mod wizard;
 
 use std::io::{IsTerminal, Write};
@@ -77,6 +78,7 @@ fn main() -> std::io::Result<()> {
         let (accounts, store) = boot(&config, &file_store);
         let mut app = App::new(interval, store, sort_mode(&config), Arc::clone(&file_store));
         app.accounts = accounts;
+        app.usage = Some(usage::scan(Utc::now()));
         app.absorb(providers::fetch_all(
             &app.accounts,
             &app.store,
@@ -295,6 +297,15 @@ fn run_tui(
 
     let (tx, rx) = mpsc::channel::<Vec<Report>>();
     let (scan_tx, scan_rx) = mpsc::channel::<Vec<providers::Detected>>();
+    // The token history is read off the local logs, which are big enough that it is
+    // spoiling its own thread. Daily columns do not need to be fresher than this.
+    let (usage_tx, usage_rx) = mpsc::channel::<usage::Usage>();
+    std::thread::spawn(move || loop {
+        if usage_tx.send(usage::scan(Utc::now())).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(300));
+    });
     let scanning = if app.accounts.is_empty() {
         std::thread::spawn(move || {
             let _ = scan_tx.send(providers::detect());
@@ -329,6 +340,9 @@ fn run_tui(
         }
         if let Ok(reports) = rx.try_recv() {
             app.absorb(reports);
+        }
+        if let Ok(usage) = usage_rx.try_recv() {
+            app.usage = Some(usage);
         }
         let due = !app.paused && last_trigger.elapsed() >= Duration::from_secs(app.interval_secs);
         if due && !app.accounts.is_empty() {

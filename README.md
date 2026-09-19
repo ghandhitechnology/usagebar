@@ -89,6 +89,21 @@ make them:
 `USAGEBAR_CONFIG_DIR` moves both files somewhere else. With no accounts configured, every
 run scans the vendor files, which is what the tool did before accounts existed.
 
+## Token graph
+
+When the pane is taller than the cards need, the space under them holds a token graph: a
+layered area, one band per provider for the last three weeks, drawn at two pixel rows per
+character cell with the days interpolated so it flows instead of stepping. The window's
+totals sit beside the title, and the busiest day is called out on the axis.
+
+It is read from the CLIs' own logs, not from the vendors: Claude Code's transcripts under
+`~/.claude/projects`, Codex's rollouts under `~/.codex/sessions`, and the OpenCode
+database's `opencode-go` messages. Accounts of one provider share a band and a colour,
+since the question the graph answers is which vendor the tokens went to. A vendor that
+keeps no local token log — Cursor, Grok, Devin, Command Code — has nothing to draw.
+The scan runs on its own thread at startup and every five minutes; the window looks 21
+days back, and logs untouched since then are never opened.
+
 ## Install
 
 ```sh

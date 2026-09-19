@@ -165,7 +165,7 @@ pub fn detect() -> Vec<Detected> {
 }
 
 /// The OpenCode Go keys live in the OpenCode database, not in a vendor auth file.
-fn opencode_db() -> PathBuf {
+pub(crate) fn opencode_db() -> PathBuf {
     if let Ok(dir) = std::env::var("OPENCODE_DATA_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir).join("opencode.db");
