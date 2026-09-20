@@ -12,6 +12,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::{self, Config, SortMode};
 use crate::credentials::{CredentialStore, FileStore, MemoryStore};
@@ -203,13 +205,17 @@ impl App {
                         if let Some(last) =
                             previous.get(&report.key).filter(|r| !r.windows.is_empty())
                         {
+                            let since = match &last.health {
+                                Health::Stale { since, .. } => *since,
+                                _ => last_good,
+                            };
                             report.windows = last.windows.clone();
                             report.facts = last.facts.clone();
                             report.notes = last.notes.clone();
                             report.plan = report.plan.or_else(|| last.plan.clone());
                             report.health = Health::Stale {
                                 why: why.clone(),
-                                since: last_good,
+                                since,
                             };
                         }
                     }
@@ -313,20 +319,28 @@ pub(crate) fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
 }
 
 pub(crate) fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
         return text.to_string();
     }
-    if width <= 1 {
-        return "…".into();
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        if used + grapheme.width() > width - 1 {
+            break;
+        }
+        out.push_str(grapheme);
+        used += grapheme.width();
     }
-    let mut out: String = text.chars().take(width - 1).collect();
     out.push('…');
     out
 }
 
 pub(crate) fn pad(text: &str, width: usize) -> String {
     let clipped = clip(text, width);
-    let len = clipped.chars().count();
+    let len = clipped.width();
     format!("{clipped}{}", " ".repeat(width.saturating_sub(len)))
 }
 
@@ -474,11 +488,11 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
     let (guide, tail) = match &app.overlay {
         None => (
             vec![
+                ("s".to_string(), "setup".to_string()),
+                ("d".to_string(), "details".to_string()),
                 ("q".to_string(), "quit".to_string()),
                 ("r".to_string(), "refresh".to_string()),
                 ("space".to_string(), "pause".to_string()),
-                ("s".to_string(), "setup".to_string()),
-                ("d".to_string(), "details".to_string()),
             ],
             Some(match &app.boot_note {
                 Some(note) => Span::styled(
@@ -498,7 +512,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }),
         ),
-        Some(Overlay::Settings(_)) => (settings::keys(), None),
+        Some(Overlay::Settings(settings)) => (settings::keys(app, settings), None),
         Some(Overlay::Wizard(wizard)) => (wizard::keys(wizard), None),
         Some(Overlay::Detail(detail)) => (crate::detail::keys(app, detail), None),
     };
@@ -515,12 +529,12 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// " q quit · r refresh ", dropping entries that do not fit. A pane too narrow for one
+/// " s setup · d details ", dropping entries that do not fit. A pane too narrow for one
 /// entry still gets the keys themselves, which is the part a newcomer needs.
 fn key_guide(entries: &[(String, String)], width: usize) -> Vec<Span<'static>> {
     let cost = |index: usize| {
         let (key, action) = &entries[index];
-        key.chars().count() + action.chars().count() + 2 + if index > 0 { 2 } else { 0 }
+        key.width() + action.width() + 2 + if index > 0 { 2 } else { 0 }
     };
     let mut budget = 0usize;
     let mut keep = 0usize;
@@ -847,11 +861,7 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
 
         // In a narrow pane the countdown rides on the same line as the bar, which buys a
         // whole line per window and keeps every provider visible.
-        let reset_width = if compact {
-            reset.chars().count().min(8) + 1
-        } else {
-            0
-        };
+        let reset_width = if compact { reset.width().min(8) + 1 } else { 0 };
         // The bar takes every column the label, percentage, and countdown do not, so its
         // right edge meets the panel edge and the detail text below it, instead of
         // stopping short and leaving the numbers floating in the middle of the panel.
@@ -872,7 +882,7 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
         ));
         if compact {
             let used = label_width + 1 + bar_width + 1 + 4;
-            let gap = width.saturating_sub(used + reset.chars().count());
+            let gap = width.saturating_sub(used + reset.width());
             if !reset.is_empty() && gap > 0 {
                 row.push(Span::raw(" ".repeat(gap)));
                 row.push(Span::styled(reset.clone(), Style::default().fg(DIM)));
@@ -896,7 +906,7 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
         ];
         if let Some(detail) = &window.detail {
             let used = label_width + 1 + sub[1].width();
-            let gap = width.saturating_sub(used + detail.chars().count());
+            let gap = width.saturating_sub(used + detail.width());
             if gap > 1 {
                 sub.push(Span::raw(" ".repeat(gap)));
                 sub.push(Span::styled(
@@ -948,6 +958,28 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    #[test]
+    fn clipping_and_padding_use_cells_without_splitting_graphemes() {
+        assert_eq!(clip("한글", 0), "");
+        assert_eq!(clip("한글", 1), "…");
+        assert_eq!(clip("한글", 3), "한…");
+        assert_eq!(clip("A한B", 4), "A한B");
+        assert_eq!(clip("e\u{301}👩‍💻한", 4), "e\u{301}👩‍💻…");
+        assert_eq!(clip("/사용자/작업/auth.json", 8), "/사용자…");
+        assert_eq!(pad("한글", 5), "한글 ");
+        assert_eq!(pad("👩‍💻", 3), "👩‍💻 ");
+        let entries = vec![("한".into(), "설정".into()), ("q".into(), "quit".into())];
+        let spans = key_guide(&entries, 8);
+        assert_eq!(spans.iter().map(Span::width).sum::<usize>(), 8);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " 한 설정"
+        );
+    }
+
     fn test_app() -> App {
         let dir = std::env::temp_dir().join(format!("usagebar-ui-{}", std::process::id()));
         App::new(
@@ -981,6 +1013,36 @@ mod tests {
             Health::Stale { why, .. } => assert_eq!(why, "HTTP 429"),
             other => panic!("expected stale, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repeated_failures_keep_the_original_stale_time() {
+        let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
+        let mut good = Report::new(ProviderId::Claude).key("claude");
+        good.windows.push(Window::new("Weekly", 42.0));
+        app.absorb(vec![good]);
+
+        app.absorb(vec![
+            Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")
+        ]);
+        let first_since = match app.reports[0].health {
+            Health::Stale { since, .. } => since,
+            ref other => panic!("expected stale, got {other:?}"),
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.absorb(vec![Report::failed(
+            ProviderId::Claude,
+            "still offline".into(),
+        )
+        .key("claude")]);
+        let second_since = match app.reports[0].health {
+            Health::Stale { since, .. } => since,
+            ref other => panic!("expected stale, got {other:?}"),
+        };
+
+        assert_eq!(second_since, first_since);
     }
 
     /// Two accounts of one provider are two panels, so one account's reading must not

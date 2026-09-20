@@ -1,5 +1,7 @@
 //! Everything one account reported, without squeezing it into a panel. Opened with d,
-//! and the arrow keys walk through the accounts.
+//! with left/right for accounts and up/down to scroll.
+
+use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -7,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::model::{AccountRef, Health};
 use crate::ui::{self, App, DIM, FAINT, TEXT};
@@ -14,6 +17,8 @@ use crate::ui::{self, App, DIM, FAINT, TEXT};
 pub struct Detail {
     /// Index into the visible accounts.
     pub index: usize,
+    scroll: usize,
+    viewport: Cell<(usize, usize)>,
 }
 
 pub enum Action {
@@ -23,7 +28,11 @@ pub enum Action {
 
 impl Detail {
     pub fn new() -> Self {
-        Self { index: 0 }
+        Self {
+            index: 0,
+            scroll: 0,
+            viewport: Cell::new((0, 1)),
+        }
     }
 }
 
@@ -54,20 +63,31 @@ pub fn keys(app: &App, detail: &Detail) -> Vec<(String, String)> {
     };
     vec![
         ("←/→".into(), format!("account {position}")),
+        ("↑/↓".into(), "scroll".into()),
         ("esc".into(), "close".into()),
     ]
 }
 
 pub fn handle(detail: &mut Detail, app: &mut App, key: KeyEvent) -> Action {
     let accounts = visible(app);
+    let (max_scroll, page) = detail.viewport.get();
+    detail.scroll = detail.scroll.min(max_scroll);
     match key.code {
         KeyCode::Esc | KeyCode::Char('d') => return Action::Close,
-        KeyCode::Left | KeyCode::Up => {
+        KeyCode::Left => {
             detail.index = detail.index.saturating_sub(1);
+            detail.scroll = 0;
         }
-        KeyCode::Right | KeyCode::Down if !accounts.is_empty() => {
+        KeyCode::Right if !accounts.is_empty() => {
             detail.index = (detail.index + 1).min(accounts.len() - 1);
+            detail.scroll = 0;
         }
+        KeyCode::Up => detail.scroll = detail.scroll.saturating_sub(1),
+        KeyCode::Down => detail.scroll = detail.scroll.saturating_add(1).min(max_scroll),
+        KeyCode::PageUp => detail.scroll = detail.scroll.saturating_sub(page),
+        KeyCode::PageDown => detail.scroll = detail.scroll.saturating_add(page).min(max_scroll),
+        KeyCode::Home => detail.scroll = 0,
+        KeyCode::End => detail.scroll = max_scroll,
         _ => {}
     }
     Action::Keep
@@ -116,11 +136,14 @@ pub fn draw(frame: &mut Frame, app: &App, detail: &Detail, area: Rect) {
                 for fact in &report.facts {
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("  {}", ui::pad(&fact.label, 20)),
+                            format!("  {} ", ui::pad(&fact.label, 20.min(text_width / 3))),
                             Style::default().fg(DIM),
                         ),
                         Span::styled(
-                            ui::clip(&fact.value, text_width.saturating_sub(24)),
+                            ui::clip(
+                                &fact.value,
+                                text_width.saturating_sub(3 + 20.min(text_width / 3)),
+                            ),
                             Style::default().fg(TEXT),
                         ),
                     ]));
@@ -197,11 +220,18 @@ pub fn draw(frame: &mut Frame, app: &App, detail: &Detail, area: Rect) {
     let inner = block.inner(box_area);
     frame.render_widget(ratatui::widgets::Clear, box_area);
     frame.render_widget(block, box_area);
-    if inner.height == 0 || inner.width < 30 {
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    detail
+        .viewport
+        .set((max_scroll, inner.height.saturating_sub(1).max(1) as usize));
+    if inner.height == 0 || inner.width == 0 {
         return;
     }
-    lines.truncate(inner.height as usize);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let offset = detail.scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        inner,
+    );
 }
 
 fn window_line(
@@ -220,12 +250,19 @@ fn window_line(
         })
         .unwrap_or_default();
     // The bar takes what the label, the percentage and the reset text leave behind.
-    let fixed = 2 + 17 + 1 + 4 + if reset_text.is_empty() { 0 } else { 2 };
+    let label_width = 16.min(width / 3);
+    let fixed = 2 + label_width + 1 + 4;
+    let reset_width = if reset_text.is_empty() {
+        0
+    } else {
+        reset_text.width() + 2
+    };
     let bar_width = width
-        .saturating_sub(fixed + reset_text.chars().count())
-        .clamp(6, 24);
+        .saturating_sub(fixed + reset_width)
+        .clamp(6, 24)
+        .min(width.saturating_sub(fixed));
     let mut spans = vec![Span::styled(
-        format!("  {}", ui::pad(&window.label, 16)),
+        format!("  {}", ui::pad(&window.label, label_width)),
         Style::default().fg(TEXT),
     )];
     spans.extend(ui::bar_spans(window.used_percent, bar_width));
@@ -235,11 +272,11 @@ fn window_line(
             .fg(ui::ramp(window.used_percent, 0.8))
             .add_modifier(Modifier::BOLD),
     ));
-    if !reset_text.is_empty() {
+    if !reset_text.is_empty() && width > fixed + bar_width + 2 {
         spans.push(Span::styled(
             format!(
                 "  {}",
-                ui::clip(&reset_text, width.saturating_sub(fixed + bar_width))
+                ui::clip(&reset_text, width.saturating_sub(fixed + bar_width + 2))
             ),
             Style::default().fg(DIM),
         ));
@@ -347,6 +384,53 @@ mod tests {
         let keys = keys(&app, &Detail::new());
         assert_eq!(keys[0].0, "←/→");
         assert!(keys[0].1.contains("1/2"), "{:?}", keys[0]);
-        assert_eq!(keys[1].0, "esc");
+        assert_eq!(keys[1].0, "↑/↓");
+        assert_eq!(keys[2].0, "esc");
+    }
+
+    #[test]
+    fn scroll_reaches_hidden_facts_and_account_navigation_resets_it() {
+        let mut report = Report::new(ProviderId::Codex).key("codex");
+        for number in 0..30 {
+            report.facts.push(Fact::quiet(
+                format!("항목 {number}"),
+                format!("value-{number}"),
+            ));
+        }
+        let mut app = app_with_report(report);
+        app.accounts
+            .push(AccountRef::new("claude", ProviderId::Claude));
+        let mut detail = Detail::new();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &detail, frame.area()))
+            .unwrap();
+        handle(&mut detail, &mut app, KeyEvent::from(KeyCode::End));
+        assert!(detail.scroll > 0);
+        terminal
+            .draw(|frame| draw(frame, &app, &detail, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("value-29"), "{text}");
+        handle(&mut detail, &mut app, KeyEvent::from(KeyCode::Up));
+        assert_eq!(detail.index, 0);
+        handle(&mut detail, &mut app, KeyEvent::from(KeyCode::Right));
+        assert_eq!(detail.index, 1);
+        assert_eq!(detail.scroll, 0);
+    }
+
+    #[test]
+    fn mixed_width_window_labels_fit_the_detail_row() {
+        let window = Window::new("주간 e\u{301}👩‍💻", 42.0).reset_at(Some(chrono::Utc::now()));
+        for width in [20, 30, 60, 90] {
+            let line = window_line(&window, width, chrono::Utc::now());
+            assert!(line.width() <= width, "{} > {width}", line.width());
+        }
     }
 }

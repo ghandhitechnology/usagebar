@@ -117,7 +117,8 @@ fn help() -> String {
          \x20 --sizes <LIST>     several frames at once, e.g. 80x24,140x45\n\
          \x20 -h, --help         show this text\n\n\
          KEYS: q quit · r refresh · space pause · s setup · d details\n\
-         Config: ~/.config/usagebar/config.json (override with USAGEBAR_CONFIG_DIR)\n"
+         Config: {config}/config.json (override with USAGEBAR_CONFIG_DIR)\n",
+        config = config::dir().display(),
     )
 }
 
@@ -296,16 +297,16 @@ fn run_tui(
     app.file_store = Arc::clone(&file_store);
     app.boot_note = config_error;
 
-    let (tx, rx) = mpsc::channel::<Vec<Report>>();
+    let (tx, rx) = mpsc::channel::<RefreshEvent>();
     let (scan_tx, scan_rx) = mpsc::channel::<Vec<providers::Detected>>();
+    let mut refresh = RefreshGate::default();
     let scanning = if app.accounts.is_empty() {
         std::thread::spawn(move || {
             let _ = scan_tx.send(providers::detect());
         });
         true
     } else {
-        trigger(&tx, &app.accounts, &app.store, app.config.sort);
-        app.refreshing = true;
+        request_refresh(&mut refresh, &tx, &mut app);
         false
     };
 
@@ -325,18 +326,24 @@ fn run_tui(
                 if !app.persisted && app.overlay.is_none() {
                     app.overlay = Some(Overlay::Wizard(Wizard::new(detected, app.config.sort)));
                 }
-                trigger(&tx, &app.accounts, &app.store, app.config.sort);
-                app.refreshing = true;
+                request_refresh(&mut refresh, &tx, &mut app);
                 last_trigger = Instant::now();
             }
         }
-        if let Ok(reports) = rx.try_recv() {
-            app.absorb(reports);
+        if let Ok(update) = rx.try_recv() {
+            match update {
+                RefreshEvent::Progress(reports) => absorb_progress(&mut app, reports),
+                RefreshEvent::Complete(reports) => {
+                    app.absorb(reports);
+                    if refresh.completed() {
+                        spawn_refresh(&tx, &mut app);
+                    }
+                }
+            }
         }
         let due = !app.paused && last_trigger.elapsed() >= Duration::from_secs(app.interval_secs);
         if due && !app.accounts.is_empty() {
-            trigger(&tx, &app.accounts, &app.store, app.config.sort);
-            app.refreshing = true;
+            request_refresh(&mut refresh, &tx, &mut app);
             last_trigger = Instant::now();
         }
 
@@ -382,13 +389,11 @@ fn run_tui(
                             }
                             OverlayAction::Refresh => {
                                 app.overlay = Some(overlay);
-                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
-                                app.refreshing = true;
+                                request_refresh(&mut refresh, &tx, &mut app);
                                 last_trigger = Instant::now();
                             }
                             OverlayAction::Saved => {
-                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
-                                app.refreshing = true;
+                                request_refresh(&mut refresh, &tx, &mut app);
                                 last_trigger = Instant::now();
                             }
                             OverlayAction::OpenWizard => {
@@ -400,8 +405,7 @@ fn run_tui(
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                             KeyCode::Char('r') => {
-                                trigger(&tx, &app.accounts, &app.store, app.config.sort);
-                                app.refreshing = true;
+                                request_refresh(&mut refresh, &tx, &mut app);
                                 last_trigger = Instant::now();
                             }
                             KeyCode::Char(' ') => app.paused = !app.paused,
@@ -431,16 +435,102 @@ fn run_tui(
     result
 }
 
-fn trigger(
-    tx: &mpsc::Sender<Vec<Report>>,
-    accounts: &[AccountRef],
-    store: &Arc<dyn CredentialStore>,
-    sort: SortMode,
-) {
+#[derive(Default)]
+struct RefreshGate {
+    in_flight: bool,
+    pending: bool,
+}
+
+impl RefreshGate {
+    /// Start immediately when idle; otherwise remember one follow-up refresh.
+    fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.pending = true;
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    /// Finish the active batch and immediately claim a queued refresh, if any.
+    fn completed(&mut self) -> bool {
+        self.in_flight = false;
+        if self.pending {
+            self.pending = false;
+            self.in_flight = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn request_refresh(gate: &mut RefreshGate, tx: &mpsc::Sender<RefreshEvent>, app: &mut App) {
+    if !app.accounts.is_empty() && gate.request() {
+        spawn_refresh(tx, app);
+    }
+}
+
+fn spawn_refresh(tx: &mpsc::Sender<RefreshEvent>, app: &mut App) {
     let tx = tx.clone();
-    let accounts = accounts.to_vec();
-    let store = Arc::clone(store);
+    let accounts = app.accounts.clone();
+    let store = Arc::clone(&app.store);
+    let sort = app.config.sort;
+    app.refreshing = true;
     std::thread::spawn(move || {
-        let _ = tx.send(providers::fetch_all(&accounts, &store, sort));
+        let reports = providers::fetch_all_progressive(&accounts, &store, sort, |reports| {
+            let _ = tx.send(RefreshEvent::Progress(reports.to_vec()));
+        });
+        let _ = tx.send(RefreshEvent::Complete(reports));
     });
+}
+
+enum RefreshEvent {
+    Progress(Vec<Report>),
+    Complete(Vec<Report>),
+}
+
+/// Show successful accounts as soon as they finish. Failures wait for the complete
+/// batch so App::absorb can preserve the previous good reading as stale.
+fn absorb_progress(app: &mut App, reports: Vec<Report>) {
+    let expected: Vec<&str> = app
+        .accounts
+        .iter()
+        .filter(|account| !account.hidden)
+        .map(|account| account.id.as_str())
+        .collect();
+    app.reports
+        .retain(|report| expected.contains(&report.key.as_str()));
+    for report in reports.into_iter().filter(|report| {
+        !matches!(report.health, Health::Unavailable(_) | Health::Stale { .. })
+            && expected.contains(&report.key.as_str())
+    }) {
+        match app
+            .reports
+            .iter()
+            .position(|current| current.key == report.key)
+        {
+            Some(index) => app.reports[index] = report,
+            None => app.reports.push(report),
+        }
+    }
+    providers::sort_reports(&mut app.reports, &app.accounts, app.config.sort);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefreshGate;
+
+    #[test]
+    fn refresh_gate_coalesces_overlapping_requests() {
+        let mut gate = RefreshGate::default();
+
+        assert!(gate.request());
+        assert!(!gate.request());
+        assert!(!gate.request());
+        assert!(gate.completed());
+        assert!(!gate.completed());
+        assert!(gate.request());
+    }
 }

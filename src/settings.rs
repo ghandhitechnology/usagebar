@@ -31,14 +31,25 @@ pub enum Action {
 }
 
 /// What the bottom bar shows while this screen is open.
-pub fn keys() -> Vec<(String, String)> {
-    vec![
-        ("↑↓".into(), "move".into()),
-        ("space".into(), "show/hide".into()),
-        ("shift+↑↓".into(), "reorder".into()),
-        ("x".into(), "remove".into()),
-        ("esc".into(), "close".into()),
-    ]
+pub fn keys(app: &App, settings: &Settings) -> Vec<(String, String)> {
+    let pair = |key: &str, action: &str| (key.to_string(), action.to_string());
+    if settings.editing.is_some() {
+        return vec![pair("enter", "save"), pair("esc", "cancel")];
+    }
+    let list = rows(app);
+    let mut keys = match list[settings.selected.min(list.len() - 1)] {
+        Row::Account(_) => vec![
+            pair("space", "show/hide"),
+            pair("x", "remove"),
+            pair("J/K", "reorder"),
+        ],
+        Row::AddAccount => vec![pair("enter", "connect")],
+        Row::Sort => vec![pair("enter", "change sort")],
+        Row::Interval => vec![pair("enter", "type seconds"), pair("←→", "adjust")],
+    };
+    keys.push(pair("↑↓/tab", "move"));
+    keys.push(pair("esc", "close"));
+    keys
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,10 +135,10 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('s') => return Action::Close,
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::BackTab => {
             settings.selected = settings.selected.saturating_sub(1);
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Tab => {
             settings.selected = (settings.selected + 1).min(list.len() - 1);
         }
         _ => {}
@@ -335,19 +346,41 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
         };
         lines.push(line);
     }
-    lines.push(Line::from(""));
-    if let Some(note) = &settings.note {
-        lines.push(Line::from(Span::styled(
-            ui::clip(note, inner.width as usize),
+    let content_height = inner.height.saturating_sub(1);
+    let offset = settings
+        .selected
+        .saturating_add(1)
+        .saturating_sub(content_height as usize)
+        .min(list.len().saturating_sub(content_height as usize));
+    frame.render_widget(
+        Paragraph::new(lines).scroll((offset as u16, 0)),
+        Rect {
+            height: content_height,
+            ..inner
+        },
+    );
+    let note = settings.note.clone().unwrap_or_else(|| {
+        if list.len() > content_height as usize {
+            format!("{} / {} · ↑↓ to scroll", settings.selected + 1, list.len())
+        } else {
+            String::new()
+        }
+    });
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            ui::clip(&note, inner.width as usize),
             Style::default().fg(ACCENT),
-        )));
-    }
-
-    frame.render_widget(Paragraph::new(lines), inner);
+        )),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
     if let Some(input) = &settings.editing {
         // Put the real cursor in the interval field, which is the last row of the list.
         let (_, column) = input.display(inner.width as usize);
-        let y = inner.y + list.len() as u16 - 1;
+        let y = inner.y + (list.len() - offset) as u16 - 1;
         let x = inner.x + 13 + column as u16;
         frame.set_cursor_position((
             x.min(inner.x + inner.width - 1),
@@ -418,6 +451,76 @@ mod tests {
             )),
         );
         (app, dir)
+    }
+
+    #[test]
+    fn many_accounts_keep_selected_settings_and_errors_visible() {
+        let (mut app, _) = test_app();
+        app.accounts = (0..20)
+            .map(|index| {
+                AccountRef::new(format!("account-{index}"), crate::model::ProviderId::Claude)
+            })
+            .collect();
+        let settings = Settings {
+            selected: 20,
+            note: Some("Connection needs attention".into()),
+            ..Settings::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &settings, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("▸    + add account"), "{text}");
+        assert!(text.contains("Connection needs attention"));
+    }
+
+    #[test]
+    fn hints_follow_tab_navigation_and_interval_editing() {
+        let (mut app, _) = test_app();
+        let mut settings = Settings::default();
+        assert_eq!(keys(&app, &settings)[0], ("enter".into(), "connect".into()));
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(keys(&app, &settings)[0].1, "change sort");
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(keys(&app, &settings)[0].1, "type seconds");
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(
+            keys(&app, &settings),
+            vec![
+                ("enter".into(), "save".into()),
+                ("esc".into(), "cancel".into())
+            ]
+        );
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        );
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, crossterm::event::KeyModifiers::SHIFT),
+        );
+        assert_eq!(settings.selected, 1);
     }
 
     /// Reordering writes through to the config file so a restart keeps the new order.
