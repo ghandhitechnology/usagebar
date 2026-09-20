@@ -19,6 +19,7 @@ use crate::model::{AccountRef, Fact, Health, ProviderId, Report, Source, Window}
 
 const UA: &str = concat!("usagebar/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(25);
+const MAX_FETCH_WORKERS: usize = 4;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -26,6 +27,7 @@ fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value)> {
     let mut req = ureq::get(url)
         .config()
         .timeout_global(Some(TIMEOUT))
+        .http_status_as_error(false)
         .build()
         .header("User-Agent", UA)
         .header("Accept", "application/json");
@@ -36,10 +38,11 @@ fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<(u16, Value)> {
         .call()
         .map_err(|e| format!("{url}: {}", transport_error(e)))?;
     let status = res.status().as_u16();
-    let body = res
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(|e| format!("{url}: unreadable response: {e}"))?;
+    let body = match res.body_mut().read_json::<Value>() {
+        Ok(body) => body,
+        Err(_) if status >= 400 => Value::Null,
+        Err(e) => return Err(format!("{url}: unreadable response: {e}")),
+    };
     Ok((status, body))
 }
 
@@ -47,6 +50,7 @@ fn post_json(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<(u16, 
     let mut req = ureq::post(url)
         .config()
         .timeout_global(Some(TIMEOUT))
+        .http_status_as_error(false)
         .build()
         .header("User-Agent", UA)
         .header("Accept", "application/json");
@@ -66,6 +70,14 @@ fn transport_error(e: ureq::Error) -> String {
     match e {
         ureq::Error::StatusCode(code) => format!("HTTP {code}"),
         other => other.to_string(),
+    }
+}
+
+fn require_success(status: u16) -> Result<()> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("request failed (HTTP {status})"))
     }
 }
 
@@ -239,6 +251,7 @@ fn claude(credential: &Credential) -> Result<Report> {
     if status == 401 || status == 403 {
         return Err("token rejected; run any Claude Code command, usagebar will pick it up".into());
     }
+    require_success(status)?;
 
     let mut report = Report::new(ProviderId::Claude).plan(subscription_type.clone());
 
@@ -416,6 +429,7 @@ fn codex_live(access_token: &str, account_id: Option<&str>) -> Result<Report> {
             "token rejected by chatgpt.com; run codex once, usagebar will pick it up".into(),
         );
     }
+    require_success(status)?;
     Ok(codex_from_wham(&body))
 }
 
@@ -548,6 +562,11 @@ fn window_label_detail(seconds: f64) -> Option<String> {
 /// Last recorded rate-limit snapshot in the newest rollout, for when the live call fails.
 fn codex_rollout(dir: &Path) -> Result<Report> {
     let newest = newest_file(&dir.join("sessions"), ".jsonl")?;
+    let age = std::fs::metadata(&newest)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .unwrap_or_default();
     let tail = tail_of(&newest, 512 * 1024)?;
     let line = tail
         .lines()
@@ -559,7 +578,12 @@ fn codex_rollout(dir: &Path) -> Result<Report> {
         .pointer("/payload/rate_limits")
         .ok_or("rate_limits missing from event")?;
 
+    let now = std::time::Instant::now();
     let mut report = Report::new(ProviderId::Codex).source(Source::LocalFile);
+    report.health = Health::Stale {
+        why: "live usage unavailable; showing the cached local reading".into(),
+        since: now.checked_sub(age).unwrap_or(now),
+    };
     for key in ["primary", "secondary"] {
         let Some(window) = limits.get(key).filter(|v| !v.is_null()) else {
             continue;
@@ -572,7 +596,7 @@ fn codex_rollout(dir: &Path) -> Result<Report> {
             Window::new(window_label(minutes * 60.0), percent).reset_at(dt(window, "resets_at")),
         );
     }
-    report.notes.push("from last local rollout".into());
+    report.notes.push("cached local Codex reading".into());
     Ok(report)
 }
 
@@ -614,9 +638,52 @@ fn tail_of(path: &Path, bytes: u64) -> Result<String> {
 
 // ---------------------------------------------------------------- opencode go
 
-/// Keys in the OpenCode credential table that could belong to the Go endpoint.
+/// Keys owned by OpenCode's own integration. Other providers use the same table,
+/// and their secrets must never be sent to the Go endpoint.
 fn opencode_keys(db: &Path) -> Result<Vec<(String, String)>> {
-    let raw = sqlite_rows(db, "select id, value from credential")?;
+    let connection = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("{}: {e}", db.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+
+    let columns = {
+        let mut statement = connection
+            .prepare("pragma table_info(credential)")
+            .map_err(|e| format!("{}: {e}", db.display()))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("{}: {e}", db.display()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("{}: {e}", db.display()))?
+    };
+    if !columns.iter().any(|column| column == "value") {
+        return Err("OpenCode credential table has no value column".into());
+    }
+
+    // OpenCode renamed connector_id to integration_id. The final branch supports
+    // the short-lived schema where the provider name itself was the row ID.
+    let query = if columns.iter().any(|column| column == "integration_id") {
+        "select id, value from credential where integration_id = ?1"
+    } else if columns.iter().any(|column| column == "connector_id") {
+        "select id, value from credential where connector_id = ?1"
+    } else if columns.iter().any(|column| column == "id") {
+        "select id, value from credential where id in (?1, 'opencode-go')"
+    } else {
+        return Err("OpenCode credential table has no ownership column".into());
+    };
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+    let raw = statement
+        .query_map(["opencode"], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("{}: {e}", db.display()))?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()
+        .map_err(|e| format!("{}: {e}", db.display()))?;
+
     let mut out = Vec::new();
     for (id, value) in raw {
         let Ok(parsed) = serde_json::from_str::<Value>(&value) else {
@@ -630,29 +697,6 @@ fn opencode_keys(db: &Path) -> Result<Vec<(String, String)>> {
         }
     }
     Ok(out)
-}
-
-/// Reads through the system sqlite3 binary; the store is a plain table and this keeps the
-/// dependency list short.
-fn sqlite_rows(db: &Path, query: &str) -> Result<Vec<(String, String)>> {
-    let out = std::process::Command::new("sqlite3")
-        .arg("-separator")
-        .arg("\u{1f}")
-        .arg(db)
-        .arg(query)
-        .output()
-        .map_err(|e| format!("sqlite3: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "sqlite3: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.split_once('\u{1f}'))
-        .map(|(id, value)| (id.to_string(), value.to_string()))
-        .collect())
 }
 
 fn opencode_go(credential: &Credential) -> Result<Report> {
@@ -711,6 +755,7 @@ fn cursor(credential: &Credential) -> Result<Report> {
     if status == 401 || status == 403 {
         return Err("session expired; sign in with cursor-agent, usagebar will pick it up".into());
     }
+    require_success(status)?;
 
     let mut report = Report::new(ProviderId::Cursor)
         .plan(s(&body, "membershipType"))
@@ -825,6 +870,7 @@ fn grok(credential: &Credential) -> Result<Report> {
     if status == 401 || status == 403 {
         return Err("session expired; run `grok login`, usagebar will pick it up".into());
     }
+    require_success(status)?;
 
     let config = body.get("config").ok_or("billing response had no config")?;
     let mut report = Report::new(ProviderId::Grok);
@@ -942,6 +988,7 @@ fn command_code(credential: &Credential) -> Result<Report> {
     if status == 401 || status == 403 {
         return Err("key rejected; run `command-code` login again".into());
     }
+    require_success(status)?;
 
     let mut report = Report::new(ProviderId::CommandCode);
     if let Some(limits) = body.get("windowLimits") {
@@ -1098,32 +1145,60 @@ pub fn fetch_all(
     store: &Arc<dyn CredentialStore>,
     sort: SortMode,
 ) -> Vec<Report> {
+    fetch_all_progressive(accounts, store, sort, |_| {})
+}
+
+/// Fetch concurrently and publish sorted snapshots as each account finishes. The
+/// final return value is the complete batch used by non-interactive commands.
+pub fn fetch_all_progressive(
+    accounts: &[AccountRef],
+    store: &Arc<dyn CredentialStore>,
+    sort: SortMode,
+    mut progress: impl FnMut(&[Report]),
+) -> Vec<Report> {
     let visible: Vec<AccountRef> = accounts
         .iter()
         .filter(|account| !account.hidden)
         .cloned()
         .collect();
-    let handles: Vec<_> = visible
-        .iter()
-        .map(|account| {
-            let account = account.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+        visible.clone(),
+    )));
+    let handles: Vec<_> = (0..visible.len().min(MAX_FETCH_WORKERS))
+        .map(|_| {
+            let queue = Arc::clone(&queue);
             let store = Arc::clone(store);
-            std::thread::spawn(move || fetch_one(&account, store.as_ref()))
-        })
-        .collect();
-
-    let mut reports: Vec<Report> = handles
-        .into_iter()
-        .zip(visible.iter())
-        .map(|(handle, account)| {
-            handle.join().unwrap_or_else(|_| {
-                Report::failed(account.provider, "adapter panicked".into())
-                    .key(account.id.clone())
-                    .label(account.label.clone())
+            let tx = tx.clone();
+            std::thread::spawn(move || loop {
+                let Some(account) = queue.lock().unwrap().pop_front() else {
+                    break;
+                };
+                let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetch_one(&account, store.as_ref())
+                }))
+                .unwrap_or_else(|_| {
+                    Report::failed(account.provider, "adapter panicked".into())
+                        .key(account.id.clone())
+                        .label(account.label.clone())
+                });
+                if tx.send(report).is_err() {
+                    break;
+                }
             })
         })
         .collect();
-    sort_reports(&mut reports, accounts, sort);
+    drop(tx);
+
+    let mut reports = Vec::with_capacity(visible.len());
+    for report in rx {
+        reports.push(report);
+        sort_reports(&mut reports, accounts, sort);
+        progress(&reports);
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
     reports
 }
 
@@ -1183,6 +1258,109 @@ pub fn sort_reports(reports: &mut [Report], accounts: &[AccountRef], mode: SortM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_db(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "usagebar-{name}-{}-{unique}.db",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn opencode_keys_only_returns_owned_key_credentials() {
+        let path = temporary_db("opencode-credentials");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            r#"
+            create table credential (
+                id text primary key,
+                integration_id text,
+                label text not null,
+                value text not null
+            );
+            insert into credential values
+                ('cred_go', 'opencode', 'Go', '{"type":"key","key":"go-secret"}'),
+                ('cred_other', 'anthropic', 'Claude', '{"type":"key","key":"other-secret"}'),
+                ('cred_oauth', 'opencode', 'OAuth', '{"type":"oauth","access":"access-secret"}'),
+                ('cred_bad', 'opencode', 'Broken', 'not json');
+            "#,
+        )
+        .unwrap();
+        drop(db);
+
+        let keys = opencode_keys(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(keys, vec![("cred_go".into(), "go-secret".into())]);
+    }
+
+    #[test]
+    fn get_json_returns_http_errors_to_the_adapter() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 256];
+            loop {
+                let read = socket.read(&mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..read]);
+                if read == 0 || request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"error\":\"denied\"}";
+            socket.write_all(response).unwrap();
+        });
+
+        let (status, body) = get_json(&format!("http://{address}"), &[]).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "denied");
+    }
+
+    #[test]
+    fn codex_local_fallback_is_marked_stale() {
+        let root = temporary_db("codex-fallback").with_extension("");
+        let sessions = root.join("sessions/2026/09/20");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout.jsonl"),
+            r#"{"payload":{"rate_limits":{"primary":{"used_percent":42,"window_minutes":300}}}}"#,
+        )
+        .unwrap();
+
+        let report = codex_rollout(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(report.source, Source::LocalFile);
+        assert_eq!(report.windows[0].used_percent, 42.0);
+        assert!(matches!(report.health, Health::Stale { .. }));
+    }
+
+    #[test]
+    fn progressive_fetch_publishes_each_finished_account() {
+        let accounts = vec![
+            AccountRef::new("claude", ProviderId::Claude).problem("offline"),
+            AccountRef::new("codex", ProviderId::Codex).problem("offline"),
+        ];
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+        let mut counts = Vec::new();
+
+        let reports = fetch_all_progressive(&accounts, &store, SortMode::Manual, |reports| {
+            counts.push(reports.len());
+        });
+
+        assert_eq!(counts, vec![1, 2]);
+        assert_eq!(reports.len(), 2);
+    }
 
     /// Vendors disagree about units and encodings; these are the shapes seen in the wild.
     #[test]

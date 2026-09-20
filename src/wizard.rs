@@ -1,10 +1,11 @@
 //! First-run setup: connect the credentials already on this machine, or paste one in.
 //! Nothing is written until the finish screen, so a half-finished wizard leaves no trace.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -44,6 +45,8 @@ pub struct Wizard {
     pub verifying: bool,
     verify_rx: Option<Receiver<Result<Report, String>>>,
     pub sort: SortMode,
+    /// Rendering clamps this offset after a terminal resize.
+    scroll: Cell<usize>,
 }
 
 pub struct Pending {
@@ -57,6 +60,8 @@ pub struct Connect {
     pub provider: ProviderId,
     pub fields: Vec<Field>,
     pub focus: usize,
+    /// Raw credentials are available only after opening the advanced form.
+    pub advanced: bool,
     /// The vendor's answer after a successful check.
     pub verified: Option<String>,
     pub error: Option<String>,
@@ -94,6 +99,7 @@ impl Wizard {
             verifying: false,
             verify_rx: None,
             sort,
+            scroll: Cell::new(0),
         }
     }
 
@@ -137,6 +143,7 @@ impl Wizard {
             Ok(Err(why)) => {
                 self.verifying = false;
                 self.verify_rx = None;
+                self.note = None;
                 if let Some(connect) = self.connect.as_mut() {
                     connect.error = Some(why);
                     connect.verified = None;
@@ -184,6 +191,7 @@ pub fn handle(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
         if key.code == KeyCode::Esc {
             wizard.verify_rx = None;
             wizard.verifying = false;
+            wizard.note = None;
             if let Some(connect) = wizard.connect.as_mut() {
                 connect.error = Some("check cancelled".into());
             }
@@ -207,8 +215,8 @@ fn welcome(wizard: &mut Wizard, _app: &mut App, key: KeyEvent) -> Action {
             // opening again on the next run. Auto-detection still applies.
             return Action::Close;
         }
-        KeyCode::Up => wizard.welcome_row = wizard.welcome_row.saturating_sub(1),
-        KeyCode::Down => wizard.welcome_row = (wizard.welcome_row + 1).min(rows - 1),
+        KeyCode::Up | KeyCode::BackTab => wizard.welcome_row = wizard.welcome_row.saturating_sub(1),
+        KeyCode::Down | KeyCode::Tab => wizard.welcome_row = (wizard.welcome_row + 1).min(rows - 1),
         KeyCode::Char(' ') => {
             if wizard.welcome_row < wizard.detected.len() {
                 let index = wizard.welcome_row;
@@ -233,6 +241,7 @@ fn welcome(wizard: &mut Wizard, _app: &mut App, key: KeyEvent) -> Action {
                 return Action::Keep;
             }
             wizard.step = Step::Done;
+            wizard.scroll.set(0);
             wizard.note = None;
         }
         _ => {}
@@ -246,8 +255,10 @@ fn provider(wizard: &mut Wizard, key: KeyEvent) -> Action {
             wizard.step = Step::Welcome;
             wizard.note = None;
         }
-        KeyCode::Up => wizard.provider_pick = wizard.provider_pick.saturating_sub(1),
-        KeyCode::Down => {
+        KeyCode::Up | KeyCode::BackTab => {
+            wizard.provider_pick = wizard.provider_pick.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Tab => {
             wizard.provider_pick = (wizard.provider_pick + 1).min(ProviderId::ALL.len() - 1)
         }
         KeyCode::Enter => {
@@ -272,16 +283,33 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
             wizard.connect = None;
             wizard.note = None;
         }
-        KeyCode::Up => {
-            connect.focus = connect.focus.saturating_sub(1);
+        KeyCode::F(2) => {
+            connect.advanced = true;
+            connect.focus = 0;
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            let fields = connect.visible_fields();
+            let current = fields
+                .iter()
+                .position(|&index| index == connect.focus)
+                .unwrap_or(0);
+            connect.focus = fields[current.saturating_sub(1)];
         }
         KeyCode::Down | KeyCode::Tab => {
-            connect.focus = (connect.focus + 1).min(connect.fields.len() - 1);
+            let fields = connect.visible_fields();
+            let current = fields
+                .iter()
+                .position(|&index| index == connect.focus)
+                .unwrap_or(0);
+            connect.focus = fields[(current + 1).min(fields.len() - 1)];
+        }
+        KeyCode::Char('s')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && connect.error.is_some() =>
+        {
+            return save_connect(wizard, app);
         }
         KeyCode::Enter => {
-            if connect.verified.is_some() || connect.error.is_some() {
-                // A failed check still allows saving: the vendor may be rate limiting
-                // or down, and the panel will keep showing why until it recovers.
+            if connect.verified.is_some() {
                 return save_connect(wizard, app);
             }
             return check(wizard);
@@ -295,6 +323,7 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
                         connect.verified = None;
                     }
                     connect.error = None;
+                    wizard.note = None;
                 }
             }
         }
@@ -406,6 +435,8 @@ fn save_connect(wizard: &mut Wizard, app: &mut App) -> Action {
 
 fn done(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
     match key.code {
+        KeyCode::Up | KeyCode::BackTab => wizard.scroll.set(wizard.scroll.get().saturating_sub(1)),
+        KeyCode::Down | KeyCode::Tab => wizard.scroll.set(wizard.scroll.get().saturating_add(1)),
         KeyCode::Esc => {
             wizard.step = Step::Welcome;
             wizard.note = None;
@@ -600,10 +631,9 @@ fn find_existing(
 impl Connect {
     pub fn new(provider: ProviderId) -> Self {
         let path = credentials::vendor_file(provider)
-            .filter(|path| path.exists())
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        let mut fields = vec![Field::new("Local config", TextInput::with_value(path))];
+        let mut fields = vec![Field::new("Login file", TextInput::with_value(path))];
         match provider {
             ProviderId::Claude => {
                 fields.push(Field::new("Access token", TextInput::new().secret()));
@@ -614,16 +644,38 @@ impl Connect {
                 fields.push(Field::new("Account id", TextInput::new()));
             }
             _ => {
-                fields.push(Field::new("Token", TextInput::new().secret()));
+                let label = match provider {
+                    ProviderId::OpenCodeGo => "Go API key",
+                    ProviderId::Cursor => "Access token",
+                    ProviderId::Grok => "Session key",
+                    _ => "API key",
+                };
+                fields.push(Field::new(label, TextInput::new().secret()));
             }
         }
-        fields.push(Field::new("Name", TextInput::new()));
+        fields.push(Field::new("Name (optional)", TextInput::new()));
+        let focus = if provider == ProviderId::OpenCodeGo {
+            1
+        } else {
+            fields.len() - 1
+        };
         Self {
             provider,
             fields,
-            focus: 0,
+            focus,
+            advanced: provider == ProviderId::OpenCodeGo,
             verified: None,
             error: None,
+        }
+    }
+
+    fn visible_fields(&self) -> Vec<usize> {
+        if self.provider == ProviderId::OpenCodeGo {
+            (1..self.fields.len()).collect()
+        } else if self.advanced {
+            (0..self.fields.len()).collect()
+        } else {
+            vec![self.fields.len() - 1]
         }
     }
 
@@ -681,9 +733,19 @@ impl Connect {
             return Ok((credential, Some(path)));
         }
         Err(match provider {
-            ProviderId::Claude => "give a credentials file, or both tokens".into(),
-            ProviderId::Codex => "give an auth.json path, or an access token".into(),
-            _ => "give a credentials file, or paste a token".into(),
+            ProviderId::Claude => {
+                "Claude login not found. Sign in with Claude Code, then retry.".into()
+            }
+            ProviderId::Codex => "Codex login not found. Sign in with Codex, then retry.".into(),
+            ProviderId::OpenCodeGo => "Paste your OpenCode Go API key.".into(),
+            ProviderId::Cursor => {
+                "Cursor login not found. Sign in with Cursor agent, then retry.".into()
+            }
+            ProviderId::Grok => "Grok login not found. Sign in with Grok CLI, then retry.".into(),
+            ProviderId::Devin => "Devin login not found. Sign in to Devin, then retry.".into(),
+            ProviderId::CommandCode => {
+                "Command Code login not found. Sign in to Command Code, then retry.".into()
+            }
         })
     }
 }
@@ -704,7 +766,7 @@ pub fn draw(frame: &mut Frame, app: &App, wizard: &Wizard, area: Rect) {
         Step::Connect => wizard
             .connect
             .as_ref()
-            .map(|connect| connect.fields.len() + 8)
+            .map(|connect| connect.visible_fields().len() + 10)
             .unwrap_or(8),
         Step::Done => wizard.total() + 8,
     };
@@ -749,20 +811,69 @@ pub fn draw(frame: &mut Frame, app: &App, wizard: &Wizard, area: Rect) {
         .note
         .clone()
         .or_else(|| wizard.connect.as_ref().and_then(|c| c.error.clone()));
+    let content_height = inner.height.saturating_sub(u16::from(note.is_some()));
+    let anchor = match wizard.step {
+        Step::Welcome => wizard.welcome_row + 2,
+        Step::Provider => wizard.provider_pick + 2,
+        Step::Connect => wizard
+            .connect
+            .as_ref()
+            .map(|connect| {
+                connect
+                    .visible_fields()
+                    .iter()
+                    .position(|&index| index == connect.focus)
+                    .unwrap_or(0)
+                    + 4
+            })
+            .unwrap_or(0),
+        Step::Done => 0,
+    };
+    let offset = if wizard.step == Step::Done {
+        let offset = wizard
+            .scroll
+            .get()
+            .min(lines.len().saturating_sub(content_height as usize));
+        wizard.scroll.set(offset);
+        offset
+    } else {
+        viewport_offset(lines.len(), content_height as usize, anchor)
+    };
+    let content = Rect {
+        height: content_height,
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), content);
     if let Some(note) = note {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            ui::clip(&note, inner.width as usize),
-            Style::default().fg(ACCENT),
-        )));
+        let status = Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                ui::clip(&note, inner.width as usize),
+                Style::default().fg(ACCENT),
+            )),
+            status,
+        );
     }
-    frame.render_widget(Paragraph::new(lines), inner);
     if let Some((x, y)) = cursor {
-        frame.set_cursor_position((
-            x.min(inner.x + inner.width - 1),
-            y.min(inner.y + inner.height - 1),
-        ));
+        if content_height > 0 {
+            frame.set_cursor_position((
+                x.min(inner.x + inner.width - 1),
+                y.saturating_sub(offset as u16)
+                    .min(inner.y + content_height - 1),
+            ));
+        }
     }
+}
+
+fn viewport_offset(lines: usize, height: usize, selected: usize) -> usize {
+    selected
+        .saturating_add(1)
+        .saturating_sub(height)
+        .min(lines.saturating_sub(height))
 }
 
 /// What the bottom bar shows while this screen is open, one line per step.
@@ -793,21 +904,28 @@ pub fn keys(wizard: &Wizard) -> Vec<(String, String)> {
         ],
         Step::Connect => {
             let connect = wizard.connect.as_ref();
-            let mut keys = vec![pair("↑↓", "field"), pair("ctrl+r", "reveal")];
+            let mut keys = Vec::new();
             if connect.is_some_and(|connect| connect.verified.is_some()) {
                 keys.push(pair("enter", "save this account"));
             } else if connect.is_some_and(|connect| connect.error.is_some()) {
-                keys.push(pair("enter", "save anyway"));
-                keys.push(pair("type", "fix"));
+                keys.push(pair("enter", "retry"));
+                keys.push(pair("ctrl+s", "save unchecked"));
             } else {
                 keys.push(pair("enter", "check"));
+            }
+            keys.push(pair("tab/shift+tab", "field"));
+            if connect.is_some_and(|connect| connect.advanced) {
+                keys.push(pair("ctrl+r", "reveal"));
+            } else {
+                keys.push(pair("f2", "advanced"));
             }
             keys.push(pair("esc", "back"));
             keys
         }
         Step::Done => vec![
-            pair("t", "sort"),
             pair("enter", "save"),
+            pair("↑↓", "scroll"),
+            pair("t", "sort"),
             pair("esc", "back"),
         ],
     }
@@ -937,12 +1055,45 @@ fn provider_lines(wizard: &Wizard, inner: Rect, lines: &mut Vec<Line>) {
             ),
             Span::styled(
                 ui::clip(
-                    provider.connect_hint(),
+                    login_instructions(*provider).0,
                     inner.width.saturating_sub(18) as usize,
                 ),
                 Style::default().fg(FAINT),
             ),
         ]));
+    }
+}
+
+fn login_instructions(provider: ProviderId) -> (&'static str, &'static str) {
+    match provider {
+        ProviderId::Claude => (
+            "Use your Claude Code login",
+            "Sign in to Claude Code, then press enter. usagebar uses its saved login.",
+        ),
+        ProviderId::Codex => (
+            "Use your Codex login",
+            "Sign in to Codex, then press enter. usagebar uses its saved login.",
+        ),
+        ProviderId::OpenCodeGo => (
+            "Use your OpenCode Go key",
+            "Paste the Go API key from your OpenCode account.",
+        ),
+        ProviderId::Cursor => (
+            "Use your Cursor agent login",
+            "Sign in to Cursor agent, then press enter. usagebar uses its saved login.",
+        ),
+        ProviderId::Grok => (
+            "Use your Grok CLI login",
+            "Sign in to Grok CLI, then press enter. usagebar uses its saved login.",
+        ),
+        ProviderId::Devin => (
+            "Use your Devin login",
+            "Sign in to Devin, then press enter. usagebar uses its saved login.",
+        ),
+        ProviderId::CommandCode => (
+            "Use your Command Code login",
+            "Sign in to Command Code, then press enter. usagebar uses its saved login.",
+        ),
     }
 }
 
@@ -955,19 +1106,30 @@ fn connect_lines(
     let Some(connect) = wizard.connect.as_ref() else {
         return;
     };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("Connect {}", connect.provider.display()),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  ({})", connect.provider.connect_hint()),
-            Style::default().fg(FAINT),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        format!("Connect {}", connect.provider.display()),
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(Span::styled(
+        login_instructions(connect.provider).1,
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        if connect.provider == ProviderId::OpenCodeGo {
+            "Manual connection · existing Go keys are detected during setup."
+        } else if connect.advanced {
+            "Advanced: pasted credentials override the login file."
+        } else if connect.fields[0].input.is_blank() {
+            "Sign in with the provider, or press F2 for advanced token entry."
+        } else {
+            "The usual login location is ready below. F2 opens advanced token entry."
+        },
+        Style::default().fg(DIM),
+    )));
     lines.push(Line::from(""));
     let field_width = inner.width.saturating_sub(20).max(10) as usize;
-    for (index, field) in connect.fields.iter().enumerate() {
+    for index in connect.visible_fields() {
+        let field = &connect.fields[index];
         let focused = index == connect.focus;
         let (shown, column) = field.input.display(field_width);
         let y = inner.y + lines.len() as u16;
@@ -1103,6 +1265,158 @@ mod tests {
         app.config_path = crate::config::config_path(dir);
         app.file_store = Arc::new(FileStore::load(dir.join("credentials.json")));
         app
+    }
+
+    #[test]
+    fn failed_check_retries_on_enter_and_requires_explicit_unchecked_save() {
+        let dir = std::env::temp_dir().join(format!("usagebar-wiz-retry-{}", std::process::id()));
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        wizard.step = Step::Connect;
+        let mut form = Connect::new(ProviderId::Cursor);
+        form.fields[0].input.set("");
+        form.error = Some("previous failure".into());
+        wizard.connect = Some(form);
+
+        // An empty form fails locally; retrying never sends a network request.
+        handle(
+            &mut wizard,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(wizard.step, Step::Connect);
+        assert!(wizard.pending.is_empty());
+        assert_eq!(
+            wizard.connect.as_ref().unwrap().error.as_deref(),
+            Some("Cursor login not found. Sign in with Cursor agent, then retry.")
+        );
+
+        wizard.connect.as_mut().unwrap().fields[1]
+            .input
+            .set("test-key");
+        handle(
+            &mut wizard,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(wizard.step, Step::Welcome);
+        assert_eq!(wizard.pending.len(), 1);
+        assert!(wizard.pending[0].summary.starts_with("saved unchecked:"));
+        assert!(!app.config_path.exists());
+    }
+
+    #[test]
+    fn login_form_hides_raw_tokens_until_advanced_and_supports_backtab() {
+        let dir =
+            std::env::temp_dir().join(format!("usagebar-wiz-navigation-{}", std::process::id()));
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        wizard.step = Step::Connect;
+        wizard.connect = Some(Connect::new(ProviderId::Claude));
+        assert_eq!(wizard.connect.as_ref().unwrap().visible_fields(), vec![3]);
+        handle(
+            &mut wizard,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+        assert_eq!(wizard.connect.as_ref().unwrap().focus, 3);
+        handle(
+            &mut wizard,
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+        assert_eq!(wizard.connect.as_ref().unwrap().focus, 3);
+        handle(
+            &mut wizard,
+            &mut app,
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            wizard.connect.as_ref().unwrap().visible_fields(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(wizard.connect.as_ref().unwrap().focus, 0);
+    }
+
+    #[test]
+    fn provider_picker_keeps_last_selection_visible_in_short_pane() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = std::env::temp_dir().join(format!("usagebar-wiz-scroll-{}", std::process::id()));
+        let app = app_with(&dir);
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        wizard.step = Step::Provider;
+        wizard.provider_pick = ProviderId::ALL.len() - 1;
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &wizard, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("▸ Command Code"), "{text}");
+    }
+
+    #[test]
+    fn go_manual_setup_offers_a_key_instead_of_an_unsupported_file_import() {
+        let form = Connect::new(ProviderId::OpenCodeGo);
+        assert_eq!(form.visible_fields(), vec![1, 2]);
+        assert_eq!(form.fields[form.focus].label, "Go API key");
+    }
+
+    #[test]
+    fn finish_screen_scrolls_immediately_and_clamps_at_the_last_line() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir =
+            std::env::temp_dir().join(format!("usagebar-wiz-finish-scroll-{}", std::process::id()));
+        let mut app = app_with(&dir);
+        let mut wizard = Wizard::new(
+            (0..12)
+                .map(|_| Detected {
+                    provider: ProviderId::Cursor,
+                    credential: Some(Credential::Token {
+                        token: "test-key".into(),
+                    }),
+                    origin: None,
+                    error: None,
+                })
+                .collect(),
+            SortMode::Manual,
+        );
+        wizard.step = Step::Done;
+        handle(
+            &mut wizard,
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &wizard, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains("12 accounts will be saved"));
+        wizard.scroll.set(usize::MAX);
+        terminal
+            .draw(|frame| draw(frame, &app, &wizard, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Interval"));
+        assert!(wizard.scroll.get() < 17);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Where a number came from. Every value shown is vendor-reported; this says which
 /// surface reported it so a wrong number can be traced back to its source.
@@ -73,21 +74,6 @@ impl ProviderId {
             ProviderId::Grok => "Grok",
             ProviderId::Devin => "Devin",
             ProviderId::CommandCode => "Command Code",
-        }
-    }
-
-    /// One line on how this provider is connected, shown while picking a provider.
-    pub fn connect_hint(self) -> &'static str {
-        match self {
-            ProviderId::Claude => {
-                "OAuth pair from Claude Code, or an import of its credentials file"
-            }
-            ProviderId::Codex => "tokens from the Codex CLI's auth.json",
-            ProviderId::OpenCodeGo => "a Go API key from the OpenCode credential store",
-            ProviderId::Cursor => "the access token from cursor-agent's auth.json",
-            ProviderId::Grok => "the session key from the Grok CLI's auth.json",
-            ProviderId::Devin => "the windsurf_api_key from Devin's credentials.toml",
-            ProviderId::CommandCode => "the API key from the Command Code CLI's auth.json",
         }
     }
 }
@@ -299,7 +285,37 @@ impl Report {
 /// wide card does not turn into a wall of text.
 pub fn short_account(label: &str) -> String {
     match label.split_once('@') {
-        Some((name, domain)) if name.len() > 12 => format!("{}…@{}", &name[..11], domain),
+        Some((name, domain)) if name.graphemes(true).count() > 12 => {
+            format!(
+                "{}…@{}",
+                name.graphemes(true).take(11).collect::<String>(),
+                domain
+            )
+        }
         _ => label.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_shortening_preserves_unicode_graphemes() {
+        assert_eq!(
+            short_account("사용자이름@example.com"),
+            "사용자이름@example.com"
+        );
+        let name = "가나다라마바사아자차카타파";
+        assert_eq!(
+            short_account(&format!("{name}@example.com")),
+            "가나다라마바사아자차카…@example.com"
+        );
+        let name = "👩‍💻e\u{301}".repeat(7);
+        let shortened = short_account(&format!("{name}@example.com"));
+        assert_eq!(
+            shortened,
+            format!("{}👩‍💻…@example.com", "👩‍💻e\u{301}".repeat(5))
+        );
     }
 }

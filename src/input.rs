@@ -1,11 +1,13 @@
 //! A single-line text field for the secret and number entry in the overlays.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Default, Clone)]
 pub struct TextInput {
     value: String,
-    /// Cursor as a character index, not a byte offset: pasted secrets can hold anything.
+    /// Cursor as a grapheme index, so a visible character is edited as one unit.
     cursor: usize,
     pub masked: bool,
 }
@@ -17,7 +19,7 @@ impl TextInput {
 
     pub fn with_value(text: impl Into<String>) -> Self {
         let value = text.into();
-        let cursor = value.chars().count();
+        let cursor = value.graphemes(true).count();
         Self {
             value,
             cursor,
@@ -41,31 +43,32 @@ impl TextInput {
 
     pub fn set(&mut self, text: impl Into<String>) {
         self.value = text.into();
-        self.cursor = self.value.chars().count();
+        self.cursor = self.value.graphemes(true).count();
     }
 
-    fn byte_at(&self, char_index: usize) -> usize {
+    fn byte_at(&self, grapheme_index: usize) -> usize {
         self.value
-            .char_indices()
-            .nth(char_index)
+            .grapheme_indices(true)
+            .nth(grapheme_index)
             .map(|(byte, _)| byte)
             .unwrap_or(self.value.len())
     }
 
     pub fn insert(&mut self, ch: char) {
-        if ch == '\n' || ch == '\r' || ch == '\t' {
-            return;
-        }
-        let at = self.byte_at(self.cursor);
-        self.value.insert(at, ch);
-        self.cursor += 1;
+        self.paste(&ch.to_string());
     }
 
     /// Pasted text arrives in one piece; newlines would break a one-line field.
     pub fn paste(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.insert(ch);
-        }
+        let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        let at = self.byte_at(self.cursor);
+        self.value.insert_str(at, &text);
+        // Inserting a combining mark or a joiner can merge adjacent graphemes.
+        self.cursor = self
+            .value
+            .grapheme_indices(true)
+            .take_while(|(byte, _)| *byte < at + text.len())
+            .count();
     }
 
     pub fn backspace(&mut self) {
@@ -79,7 +82,7 @@ impl TextInput {
     }
 
     pub fn delete(&mut self) {
-        if self.cursor >= self.value.chars().count() {
+        if self.cursor >= self.value.graphemes(true).count() {
             return;
         }
         let from = self.byte_at(self.cursor);
@@ -92,7 +95,7 @@ impl TextInput {
     }
 
     pub fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.value.chars().count());
+        self.cursor = (self.cursor + 1).min(self.value.graphemes(true).count());
     }
 
     pub fn home(&mut self) {
@@ -100,7 +103,7 @@ impl TextInput {
     }
 
     pub fn end(&mut self) {
-        self.cursor = self.value.chars().count();
+        self.cursor = self.value.graphemes(true).count();
     }
 
     /// Returns true when the value changed, so callers can tell an edit from a cursor move.
@@ -145,36 +148,37 @@ impl TextInput {
         }
     }
 
-    /// The visible slice and where the cursor lands inside it, both in characters.
+    /// The visible slice and cursor column, measured in terminal cells.
     pub fn display(&self, width: usize) -> (String, usize) {
         if width == 0 {
             return (String::new(), 0);
         }
-        let chars: Vec<char> = self.value.chars().collect();
-        let mut scroll = 0;
-        if self.cursor < scroll {
-            scroll = self.cursor;
-        }
-        if self.cursor >= scroll + width {
-            // Keep the cursor at the right edge, except at the end of the value where
-            // the last full window is more useful than an empty cell.
-            scroll = if self.cursor >= chars.len() {
-                chars.len().saturating_sub(width)
-            } else {
-                (self.cursor + 1).saturating_sub(width)
-            };
-        }
-        let shown: String = chars
-            .iter()
-            .skip(scroll)
-            .take(width)
-            .map(|ch| if self.masked { '•' } else { *ch })
+        let graphemes: Vec<&str> = self
+            .value
+            .graphemes(true)
+            .map(|text| if self.masked { "•" } else { text })
             .collect();
-        let cursor_column = self
-            .cursor
-            .saturating_sub(scroll)
-            .min(width.saturating_sub(1));
-        (shown, cursor_column)
+        let cursor = self.cursor.min(graphemes.len());
+        let cursor_width = graphemes.get(cursor).map_or(0, |text| text.width().max(1));
+        let budget = width.saturating_sub(cursor_width);
+        let mut scroll = cursor;
+        let mut column = 0;
+        while scroll > 0 && column + graphemes[scroll - 1].width() <= budget {
+            scroll -= 1;
+            column += graphemes[scroll].width();
+        }
+        let mut shown = String::new();
+        let mut used = 0;
+        let mut last_column = 0;
+        for text in &graphemes[scroll..] {
+            if used + text.width() > width {
+                break;
+            }
+            last_column = used;
+            used += text.width();
+            shown.push_str(text);
+        }
+        (shown, if column >= width { last_column } else { column })
     }
 }
 
@@ -261,5 +265,40 @@ mod tests {
         assert!(!input.handle_key(key(KeyCode::Left)));
         assert!(input.handle_key(key(KeyCode::Char('z'))));
         assert_eq!(input.value(), "abzc");
+    }
+
+    #[test]
+    fn edits_combining_marks_and_joined_emoji_as_one_character() {
+        let mut input = TextInput::with_value("Ae\u{301}👩‍💻한");
+        input.left();
+        input.backspace();
+        assert_eq!(input.value(), "Ae\u{301}한");
+        input.left();
+        input.delete();
+        assert_eq!(input.value(), "A한");
+        input.home();
+        input.right();
+        input.insert('\u{301}');
+        input.backspace();
+        assert_eq!(input.value(), "한");
+    }
+
+    #[test]
+    fn display_uses_cells_and_keeps_wide_graphemes_whole() {
+        let mut input = TextInput::with_value("/한글/e\u{301}👩‍💻");
+        let (shown, cursor) = input.display(5);
+        assert_eq!(shown, "/e\u{301}👩‍💻");
+        assert_eq!(cursor, 4);
+        input.left();
+        assert_eq!(input.display(4), ("/e\u{301}👩‍💻".into(), 2));
+        input.home();
+        input.right();
+        assert_eq!(input.display(2), ("한".into(), 0));
+        assert_eq!(input.display(1), (String::new(), 0));
+        assert_eq!(input.display(0), (String::new(), 0));
+        let input = TextInput::with_value("가나다");
+        assert_eq!(input.display(4), ("나다".into(), 2));
+        let input = TextInput::with_value("e\u{301}👩‍💻한").secret();
+        assert_eq!(input.display(8), ("•••".into(), 3));
     }
 }

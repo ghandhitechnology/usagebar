@@ -5,7 +5,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|path| !path.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|path| !path.is_empty()));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|path| !path.is_empty()));
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// A directory named by an environment variable, or a path under the home directory.
@@ -24,6 +33,19 @@ pub fn xdg_dir(env_key: &str, leaf: &str, default_under_home: &str) -> PathBuf {
     if let Ok(root) = std::env::var(env_key) {
         if !root.is_empty() {
             return PathBuf::from(root).join(leaf);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let native = match env_key {
+            "XDG_CONFIG_HOME" => "APPDATA",
+            "XDG_DATA_HOME" => "LOCALAPPDATA",
+            _ => "",
+        };
+        if !native.is_empty() {
+            if let Some(root) = std::env::var_os(native).filter(|path| !path.is_empty()) {
+                return PathBuf::from(root).join(leaf);
+            }
         }
     }
     home().join(default_under_home)
