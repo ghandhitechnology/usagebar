@@ -196,6 +196,7 @@ mod tests {
         let path = dir.join("credentials.json");
         write_atomic(&path, b"secret", Some(0o600)).unwrap();
         assert!(is_private(&path));
+        #[cfg(unix)]
         assert_eq!(mode_of(&path), Some(0o600));
         std::fs::remove_dir_all(&dir).ok();
     }
