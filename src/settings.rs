@@ -411,22 +411,12 @@ fn status_of(app: &App, account: &AccountRef) -> (String, ratatui::style::Color)
         return ("hidden".into(), FAINT);
     }
     match app.report_for(&account.id) {
-        Some(report) => match (&report.health, report.peak()) {
-            (Health::Unavailable(_), _) => ("unavailable".into(), DIM),
-            (_, Some(peak)) => {
-                let window = report
-                    .windows
-                    .iter()
-                    .max_by(|a, b| {
-                        a.used_percent
-                            .partial_cmp(&b.used_percent)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|w| w.label.clone())
-                    .unwrap_or_default();
-                (format!("{peak:.0}% {window}"), DIM)
-            }
-            _ => ("no data".into(), DIM),
+        Some(report) => match &report.health {
+            Health::Unavailable(_) => ("unavailable".into(), DIM),
+            _ => match &report.account {
+                Some(email) if !email.is_empty() => (email.chars().take(7).collect(), DIM),
+                _ => (String::new(), DIM),
+            },
         },
         None => ("…".into(), FAINT),
     }
