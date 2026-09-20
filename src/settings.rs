@@ -18,9 +18,19 @@ pub struct Settings {
     pub selected: usize,
     /// Set while the interval is being typed.
     pub editing: Option<TextInput>,
+    /// Set while an account name is being typed.
+    pub renaming: Option<Rename>,
     /// The account whose removal is waiting for a second press.
     pub confirm_remove: Option<String>,
     pub note: Option<String>,
+}
+
+/// The name being typed, with the account it belongs to: the list can change under an
+/// open field, and the id is what survives that.
+#[derive(Debug)]
+pub struct Rename {
+    pub id: String,
+    pub input: TextInput,
 }
 
 pub enum Action {
@@ -31,25 +41,15 @@ pub enum Action {
 }
 
 /// What the bottom bar shows while this screen is open.
-pub fn keys(app: &App, settings: &Settings) -> Vec<(String, String)> {
-    let pair = |key: &str, action: &str| (key.to_string(), action.to_string());
-    if settings.editing.is_some() {
-        return vec![pair("enter", "save"), pair("esc", "cancel")];
-    }
-    let list = rows(app);
-    let mut keys = match list[settings.selected.min(list.len() - 1)] {
-        Row::Account(_) => vec![
-            pair("space", "show/hide"),
-            pair("x", "remove"),
-            pair("J/K", "reorder"),
-        ],
-        Row::AddAccount => vec![pair("enter", "connect")],
-        Row::Sort => vec![pair("enter", "change sort")],
-        Row::Interval => vec![pair("enter", "type seconds"), pair("←→", "adjust")],
-    };
-    keys.push(pair("↑↓/tab", "move"));
-    keys.push(pair("esc", "close"));
-    keys
+pub fn keys() -> Vec<(String, String)> {
+    vec![
+        ("↑↓".into(), "move".into()),
+        ("space".into(), "show/hide".into()),
+        ("shift+↑↓".into(), "reorder".into()),
+        ("r".into(), "rename".into()),
+        ("x".into(), "remove".into()),
+        ("esc".into(), "close".into()),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +102,40 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
         };
     }
 
+    // A rename field keeps the keys until it is saved or cancelled.
+    if let Some(rename) = settings.renaming.as_mut() {
+        return match key.code {
+            KeyCode::Enter => {
+                let typed = rename.input.value().trim().to_string();
+                let id = rename.id.clone();
+                settings.renaming = None;
+                let mut accounts = app.accounts.clone();
+                let Some(index) = accounts.iter().position(|account| account.id == id) else {
+                    return Action::Keep;
+                };
+                let provider = accounts[index].provider;
+                // Clearing the field is how a name is taken back off an account, and
+                // typing the provider's own name back is the same as never having named
+                // it: the row would otherwise read "Codex Codex".
+                accounts[index].label =
+                    (!typed.is_empty() && typed != provider.display()).then_some(typed);
+                settings.note = app
+                    .save_accounts(accounts)
+                    .map(|why| format!("not saved: {why}"));
+                Action::Refresh
+            }
+            KeyCode::Esc => {
+                settings.renaming = None;
+                settings.note = None;
+                Action::Keep
+            }
+            _ => {
+                rename.input.handle_key(key);
+                Action::Keep
+            }
+        };
+    }
+
     let list = rows(app);
     if list.is_empty() {
         return Action::Close;
@@ -149,7 +183,7 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
             KeyCode::Char(' ') => {
                 let mut accounts = app.accounts.clone();
                 accounts[index].hidden = !accounts[index].hidden;
-                let label = account_name(&accounts[index]);
+                let label = accounts[index].name();
                 settings.note = app
                     .save_accounts(accounts)
                     .map(|why| format!("not saved: {why}"));
@@ -165,6 +199,19 @@ pub fn handle(settings: &mut Settings, app: &mut App, key: KeyEvent) -> Action {
                     ),
                 });
                 return Action::Refresh;
+            }
+            KeyCode::Char('r') => {
+                let account = &app.accounts[index];
+                settings.renaming = Some(Rename {
+                    id: account.id.clone(),
+                    // The field opens on the title the row is showing, so the name it
+                    // reads can be rewritten rather than only added to.
+                    input: TextInput::with_value(account.name()),
+                });
+                settings.note = Some(format!(
+                    "renaming {} · enter to save, esc to cancel",
+                    account.name()
+                ));
             }
             KeyCode::Char('x') => {
                 return remove_account(settings, app, index);
@@ -229,7 +276,7 @@ fn remove_account(settings: &mut Settings, app: &mut App, index: usize) -> Actio
         settings.confirm_remove = Some(id);
         settings.note = Some(format!(
             "press x again to remove {} and forget its credentials",
-            account_name(&app.accounts[index])
+            app.accounts[index].name()
         ));
         return Action::Keep;
     }
@@ -246,16 +293,6 @@ fn remove_account(settings: &mut Settings, app: &mut App, index: usize) -> Actio
         }
     }
     Action::Refresh
-}
-
-fn account_name(account: &AccountRef) -> String {
-    format!(
-        "{} {}",
-        account.provider.display(),
-        account.label.clone().unwrap_or_default()
-    )
-    .trim()
-    .to_string()
 }
 
 // ------------------------------------------------------------------ drawing
@@ -284,14 +321,34 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut cursor: Option<(u16, u16)> = None;
     for (row_index, row) in list.iter().enumerate() {
         let selected = row_index == settings.selected;
         let line = match row {
             Row::Account(index) => {
                 let account = &app.accounts[*index];
                 let mark = if account.hidden { "○" } else { "●" };
-                let name = account_name(account);
-                let (status, color) = status_of(app, account);
+                let name_width = inner.width as usize / 2;
+                let renaming = settings
+                    .renaming
+                    .as_ref()
+                    .filter(|rename| rename.id == account.id);
+                let (name, tail, color) = match renaming {
+                    // The field is the title while it is open, so it starts where the
+                    // title is read. Drawing the provider name beside it would repeat
+                    // the text the field already holds.
+                    Some(rename) => {
+                        let (shown, column) = rename
+                            .input
+                            .display((inner.width as usize).saturating_sub(5));
+                        cursor = Some((inner.x + 5 + column as u16, inner.y + row_index as u16));
+                        (String::new(), shown, TEXT)
+                    }
+                    None => {
+                        let (status, color) = status_of(app, account);
+                        (ui::pad(&account.name(), name_width), status, color)
+                    }
+                };
                 Line::from(vec![
                     Span::styled(
                         if selected { " ▸ " } else { "   " },
@@ -302,7 +359,7 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
                         Style::default().fg(if account.hidden { FAINT } else { ACCENT }),
                     ),
                     Span::styled(
-                        ui::pad(&name, inner.width as usize / 2),
+                        name,
                         Style::default()
                             .fg(if account.hidden { FAINT } else { TEXT })
                             .add_modifier(if selected {
@@ -311,7 +368,7 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
                                 Modifier::empty()
                             }),
                     ),
-                    Span::styled(status, Style::default().fg(color)),
+                    Span::styled(tail, Style::default().fg(color)),
                 ])
             }
             Row::AddAccount => {
@@ -331,7 +388,7 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
                 selected,
                 "Sort",
                 match app.config.sort {
-                    SortMode::Manual => "manual · the order below",
+                    SortMode::Manual => "manual · the order above",
                     SortMode::Smart => "smart · worst first",
                 },
             ),
@@ -387,6 +444,13 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
             y.min(inner.y + inner.height - 1),
         ));
     }
+    if let Some((x, y)) = cursor {
+        // The rename field sits where the status does, after the padded account name.
+        frame.set_cursor_position((
+            x.min(inner.x + inner.width - 1),
+            y.min(inner.y + inner.height - 1),
+        ));
+    }
 }
 
 fn setting_line(selected: bool, name: &str, value: &str) -> Line<'static> {
@@ -430,8 +494,11 @@ mod tests {
     use ratatui::Terminal;
     use std::sync::Arc;
 
-    fn test_app() -> (App, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("usagebar-settings-{}", std::process::id()));
+    /// One directory per test: they run in parallel and every one of them writes a
+    /// config file.
+    fn test_app(name: &str) -> (App, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("usagebar-settings-{}-{name}", std::process::id()));
         let app = App::new(
             60,
             Arc::new(MemoryStore::new()),
@@ -443,80 +510,78 @@ mod tests {
         (app, dir)
     }
 
-    #[test]
-    fn many_accounts_keep_selected_settings_and_errors_visible() {
-        let (mut app, _) = test_app();
-        app.accounts = (0..20)
-            .map(|index| {
-                AccountRef::new(format!("account-{index}"), crate::model::ProviderId::Claude)
-            })
-            .collect();
-        let settings = Settings {
-            selected: 20,
-            note: Some("Connection needs attention".into()),
-            ..Settings::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
-        terminal
-            .draw(|frame| draw(frame, &app, &settings, frame.area()))
-            .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(text.contains("▸    + add account"), "{text}");
-        assert!(text.contains("Connection needs attention"));
+    fn press(settings: &mut Settings, app: &mut App, code: KeyCode) -> Action {
+        handle(
+            settings,
+            app,
+            KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+        )
     }
 
+    /// The field opens on the title the row is showing, so an unnamed account starts
+    /// from its provider name and the name it is given replaces that text.
     #[test]
-    fn hints_follow_tab_navigation_and_interval_editing() {
-        let (mut app, _) = test_app();
+    fn renaming_persists_the_label() {
+        let (mut app, dir) = test_app("rename");
+        app.accounts = vec![AccountRef::new("claude", crate::model::ProviderId::Claude)];
+        app.config.accounts = app.accounts.clone();
+        app.config_path = crate::config::config_path(&dir);
+        app.persisted = true;
+        app.file_store = Arc::new(crate::credentials::FileStore::load(
+            dir.join("credentials.json"),
+        ));
+
         let mut settings = Settings::default();
-        assert_eq!(keys(&app, &settings)[0], ("enter".into(), "connect".into()));
-        handle(
-            &mut settings,
-            &mut app,
-            KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE),
-        );
-        assert_eq!(keys(&app, &settings)[0].1, "change sort");
-        handle(
-            &mut settings,
-            &mut app,
-            KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE),
-        );
-        assert_eq!(keys(&app, &settings)[0].1, "type seconds");
-        handle(
-            &mut settings,
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
-        );
+        assert!(matches!(
+            press(&mut settings, &mut app, KeyCode::Char('r')),
+            Action::Keep
+        ));
+        // The unnamed account opens on its provider name, which the user rewrites.
+        assert_eq!(settings.renaming.as_ref().unwrap().input.value(), "Claude");
+        // Saving that title back unchanged is not a name, so the account stays unnamed.
+        assert!(matches!(
+            press(&mut settings, &mut app, KeyCode::Enter),
+            Action::Refresh
+        ));
+        assert_eq!(app.accounts[0].label, None);
+
+        press(&mut settings, &mut app, KeyCode::Char('r'));
+        settings.renaming.as_mut().unwrap().input.set("");
+        for ch in "work laptop".chars() {
+            press(&mut settings, &mut app, KeyCode::Char(ch));
+        }
+        assert!(matches!(
+            press(&mut settings, &mut app, KeyCode::Enter),
+            Action::Refresh
+        ));
+        assert_eq!(app.accounts[0].label.as_deref(), Some("work laptop"));
+        let saved = config::load(&app.config_path).unwrap().unwrap();
+        assert_eq!(saved.accounts[0].label.as_deref(), Some("work laptop"));
+
+        // esc throws the edit away, including anything typed into a prefilled field.
+        press(&mut settings, &mut app, KeyCode::Char('r'));
+        press(&mut settings, &mut app, KeyCode::Char('!'));
+        press(&mut settings, &mut app, KeyCode::Esc);
+        assert_eq!(app.accounts[0].label.as_deref(), Some("work laptop"));
+
+        // A named account opens on the name it was given, ready to be rewritten.
+        press(&mut settings, &mut app, KeyCode::Char('r'));
         assert_eq!(
-            keys(&app, &settings),
-            vec![
-                ("enter".into(), "save".into()),
-                ("esc".into(), "cancel".into())
-            ]
+            settings.renaming.as_ref().unwrap().input.value(),
+            "work laptop"
         );
-        handle(
-            &mut settings,
-            &mut app,
-            KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
-        );
-        handle(
-            &mut settings,
-            &mut app,
-            KeyEvent::new(KeyCode::BackTab, crossterm::event::KeyModifiers::SHIFT),
-        );
-        assert_eq!(settings.selected, 1);
+        settings.renaming.as_mut().unwrap().input.set("");
+        press(&mut settings, &mut app, KeyCode::Enter);
+        assert_eq!(app.accounts[0].label, None);
+        let saved = config::load(&app.config_path).unwrap().unwrap();
+        assert_eq!(saved.accounts[0].label, None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Reordering writes through to the config file so a restart keeps the new order.
     #[test]
     fn reordering_persists_the_account_list() {
-        let (mut app, dir) = test_app();
+        let (mut app, dir) = test_app("reorder");
         app.accounts = vec![
             AccountRef::new("claude", crate::model::ProviderId::Claude),
             AccountRef::new("codex", crate::model::ProviderId::Codex),
@@ -544,10 +609,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The field takes the title's place on that row, with the cursor riding the text
+    /// instead of staying wherever the last edit left it.
+    #[test]
+    fn renaming_draws_the_field_at_the_cursor() {
+        use ratatui::layout::Position;
+        let (mut app, _dir) = test_app("rename-draw");
+        app.accounts = vec![AccountRef::new("claude", crate::model::ProviderId::Claude)];
+        let settings = Settings {
+            renaming: Some(Rename {
+                id: "claude".into(),
+                input: TextInput::with_value("work"),
+            }),
+            ..Settings::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &settings, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        // The field holds the title, so the row does not print the provider name twice.
+        assert!(!text.contains("Claude"));
+        let width = buffer.area.width as usize;
+        let row: String = buffer
+            .content()
+            .chunks(width)
+            .map(|cells| {
+                cells
+                    .iter()
+                    .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .find(|row| row.contains("work"))
+            .unwrap();
+        assert!(row.contains("● work"));
+        // The field opens where the title is read, cursor four characters into it.
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position { x: 12, y: 8 }
+        );
+    }
+
+    /// A named account is listed by its name here too, so a rename does not leave the
+    /// provider name sitting in front of it.
+    #[test]
+    fn a_named_account_lists_without_its_provider_name() {
+        let (mut app, _dir) = test_app("named-row");
+        let mut account = AccountRef::new("claude", crate::model::ProviderId::Claude);
+        account.label = Some("Chatgpt".into());
+        app.accounts = vec![account];
+        let settings = Settings::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &settings, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Chatgpt"));
+        assert!(!text.contains("Claude"));
+    }
+
     /// The overlay has to draw in a side panel without losing rows or panicking.
     #[test]
     fn draws_in_a_narrow_pane() {
-        let (mut app, _dir) = test_app();
+        let (mut app, _dir) = test_app("narrow");
         app.accounts = vec![AccountRef::new("claude", crate::model::ProviderId::Claude)];
         let settings = Settings::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

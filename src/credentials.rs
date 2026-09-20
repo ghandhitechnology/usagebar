@@ -33,6 +33,10 @@ pub enum Credential {
         account_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         refresh_token: Option<String>,
+        /// Milliseconds since the epoch, when the vendor said so. Absent for a pair
+        /// imported from the CLI, which refreshes its own.
+        #[serde(default)]
+        expires_at: i64,
     },
     Token {
         token: String,
@@ -258,6 +262,8 @@ pub fn from_vendor_file(provider: ProviderId, path: &Path) -> Option<Credential>
                 access_token: string(tokens.get("access_token"))?,
                 account_id: string(tokens.get("account_id")),
                 refresh_token: string(tokens.get("refresh_token")),
+                // The CLI keeps its own copy fresh; the file never says when it expires.
+                expires_at: 0,
             })
         }
         ProviderId::Cursor => Some(Credential::Token {
@@ -444,6 +450,7 @@ mod tests {
                 access_token: "at".into(),
                 account_id: Some("acc".into()),
                 refresh_token: Some("rt".into()),
+                expires_at: 0,
             }
         );
         let devin = dir.join("credentials.toml");

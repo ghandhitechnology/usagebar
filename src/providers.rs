@@ -16,6 +16,7 @@ use crate::config::SortMode;
 use crate::credentials::{self, Credential, CredentialStore, MemoryStore, StoredCredential};
 use crate::fsutil;
 use crate::model::{AccountRef, Fact, Health, ProviderId, Report, Source, Window};
+use crate::oauth;
 
 const UA: &str = concat!("usagebar/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(25);
@@ -59,6 +60,38 @@ fn post_json(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<(u16, 
     }
     let mut res = req
         .send_json(body)
+        .map_err(|e| format!("{url}: {}", transport_error(e)))?;
+    let status = res.status().as_u16();
+    let body = res.body_mut().read_json::<Value>().unwrap_or(Value::Null);
+    Ok((status, body))
+}
+
+/// Some vendors only accept the OAuth form encoding, so the sign-in's token requests go
+/// through here rather than as JSON.
+fn form_body(fields: &[(&str, &str)]) -> String {
+    fields
+        .iter()
+        .map(|(key, value)| format!("{}={}", urlencode(key), urlencode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// A token POST that keeps the vendor's refusal. ureq folds a non-2xx into an error and
+/// the body goes with it, but a sign-in is where the vendor explains itself — "could not
+/// validate your token", "the code expired" — and that is what the user needs to read.
+fn post_token(url: &str, headers: &[(&str, &str)], body: &str) -> Result<(u16, Value)> {
+    let mut req = ureq::post(url)
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(TIMEOUT))
+        .build()
+        .header("User-Agent", UA)
+        .header("Accept", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let mut res = req
+        .send(body)
         .map_err(|e| format!("{url}: {}", transport_error(e)))?;
     let status = res.status().as_u16();
     let body = res.body_mut().read_json::<Value>().unwrap_or(Value::Null);
@@ -177,7 +210,7 @@ pub fn detect() -> Vec<Detected> {
 }
 
 /// The OpenCode Go keys live in the OpenCode database, not in a vendor auth file.
-fn opencode_db() -> PathBuf {
+pub(crate) fn opencode_db() -> PathBuf {
     if let Ok(dir) = std::env::var("OPENCODE_DATA_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir).join("opencode.db");
@@ -231,6 +264,138 @@ fn detect_opencode_go() -> Vec<Detected> {
 // ---------------------------------------------------------------- claude
 
 const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// Claude's redirect is a hosted page that shows the code for the user to carry back:
+/// the registered client has no loopback URL, so there is nothing here to listen on.
+const CLAUDE_OAUTH_REDIRECT: &str = "https://platform.claude.com/oauth/code/callback";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// Codex's redirect is a loopback URL, and the client only redirects to the exact one it
+/// was registered with, port included.
+const CODEX_OAUTH_PORT: u16 = 1455;
+
+/// The browser sign-in a provider offers, with the same client its own CLI signs in
+/// with. Both are taken from the installed CLIs: a client id or redirect this file
+/// invented would be refused in the browser, where nothing can be done about it.
+pub fn oauth_spec(provider: ProviderId) -> Option<oauth::Spec> {
+    match provider {
+        ProviderId::Codex => Some(oauth::Spec {
+            authorize: "https://auth.openai.com/oauth/authorize",
+            token: "https://auth.openai.com/oauth/token",
+            client_id: CODEX_OAUTH_CLIENT_ID,
+            scopes: "openid profile email offline_access",
+            redirect: "http://localhost:1455/auth/callback",
+            extra: &[
+                ("id_token_add_organizations", "true"),
+                ("codex_cli_simplified_flow", "true"),
+                ("originator", "codex_cli_rs"),
+            ],
+            callback_port: Some(CODEX_OAUTH_PORT),
+        }),
+        ProviderId::Claude => Some(oauth::Spec {
+            authorize: "https://platform.claude.com/oauth/authorize",
+            // The endpoint this tool already rotates Claude tokens against.
+            token: "https://console.anthropic.com/v1/oauth/token",
+            client_id: CLAUDE_OAUTH_CLIENT_ID,
+            scopes: "org:create_api_key user:profile user:inference",
+            redirect: CLAUDE_OAUTH_REDIRECT,
+            extra: &[],
+            callback_port: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Trade an authorization code for the credential usagebar stores. The two vendors
+/// differ: Anthropic takes JSON and names the subscription in the response, while
+/// OpenAI takes a form and hides the account id inside the id_token.
+pub fn oauth_exchange(provider: ProviderId, code: &str, verifier: &str) -> Result<Credential> {
+    let spec = oauth_spec(provider).ok_or("this provider has no browser sign-in")?;
+    let (status, body) = match provider {
+        ProviderId::Claude => post_token(
+            spec.token,
+            &[
+                ("Content-Type", "application/json"),
+                ("anthropic-beta", "oauth-2025-04-20"),
+            ],
+            &serde_json::json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": spec.redirect,
+                "client_id": spec.client_id,
+                "code_verifier": verifier,
+            })
+            .to_string(),
+        )?,
+        _ => post_token(
+            spec.token,
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            &form_body(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", spec.redirect),
+                ("client_id", spec.client_id),
+                ("code_verifier", verifier),
+            ]),
+        )?,
+    };
+
+    let access_token = match s(&body, "access_token") {
+        Some(token) => token,
+        None => return Err(refused(status, &body)),
+    };
+    let refresh_token = s(&body, "refresh_token").unwrap_or_default();
+    let expires_at = Utc::now().timestamp_millis() + expires_in_ms(&body);
+    Ok(match provider {
+        ProviderId::Claude => Credential::ClaudeOauth {
+            access_token,
+            refresh_token,
+            expires_at,
+            // Claude Code reads the plan off the token response, so a signed-in account
+            // can show it as readily as an imported one.
+            subscription_type: s(&body, "subscriptionType"),
+        },
+        _ => Credential::CodexTokens {
+            access_token,
+            account_id: body
+                .get("id_token")
+                .and_then(Value::as_str)
+                .and_then(codex_account_id),
+            refresh_token: (!refresh_token.is_empty()).then_some(refresh_token),
+            expires_at,
+        },
+    })
+}
+
+/// The account a Codex token set belongs to, which every usage call has to name. The
+/// claim key is a URL, so it is read by name rather than with a JSON pointer, which
+/// would take its slashes for path separators.
+fn codex_account_id(id_token: &str) -> Option<String> {
+    jwt_payload(id_token)?
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn expires_in_ms(body: &Value) -> i64 {
+    // A floor of a minute, so a vendor that reports a token as already gone still leaves
+    // one round trip to notice, rather than a refresh on every poll.
+    (f(body, "expires_in").unwrap_or(3600.0) as i64).max(60) * 1000
+}
+
+/// A token response with no token in it: the vendor's own words when it has any.
+fn refused(status: u16, body: &Value) -> String {
+    format!("the sign-in was refused: {}", refusal_reason(status, body))
+}
+
+/// Why a token response carried no tokens, as the vendor put it.
+fn refusal_reason(status: u16, body: &Value) -> String {
+    body.pointer("/error/message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| s(body, "error_description"))
+        .or_else(|| s(body, "error"))
+        .unwrap_or_else(|| format!("HTTP {status}"))
+}
 
 fn claude(credential: &Credential) -> Result<Report> {
     let Credential::ClaudeOauth {
@@ -350,7 +515,7 @@ fn rotate_claude(
     }
     let client_id = std::env::var("CLAUDE_CODE_OAUTH_CLIENT_ID")
         .unwrap_or_else(|_| CLAUDE_OAUTH_CLIENT_ID.to_string());
-    let (status, body) = post_json(
+    let (status, body) = post_token(
         "https://console.anthropic.com/v1/oauth/token",
         &[
             ("Content-Type", "application/json"),
@@ -360,13 +525,15 @@ fn rotate_claude(
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": client_id,
-        }),
+        })
+        .to_string(),
     )?;
     let Some(access) = body.get("access_token").and_then(Value::as_str) else {
-        return Err(match status {
-            200 => "refresh returned no access_token".to_string(),
-            _ => format!("refresh failed (HTTP {status}); run any Claude Code command once"),
-        });
+        // The vendor says why when it will, and the status is all there is otherwise.
+        return Err(format!(
+            "refresh failed ({}); run any Claude Code command once",
+            refusal_reason(status, &body)
+        ));
     };
     let refresh = body
         .get("refresh_token")
@@ -387,6 +554,74 @@ fn rotate_claude(
 }
 
 // ---------------------------------------------------------------- codex
+
+/// Keep a signed-in Codex account alive. Only the credentials this tool signed in for are
+/// refreshed: a token imported from the CLI's file belongs to the CLI, which rotates its
+/// own, and spending its refresh token here would sign the user out of codex.
+fn rotate_codex(
+    account: &AccountRef,
+    store: &dyn CredentialStore,
+    stored: &StoredCredential,
+) -> Result<StoredCredential> {
+    let Credential::CodexTokens {
+        refresh_token,
+        account_id,
+        expires_at,
+        ..
+    } = &stored.secret
+    else {
+        return Err("stored credential is not a Codex token set".into());
+    };
+    let now = Utc::now().timestamp_millis();
+    if *expires_at > now + 60_000 {
+        return Ok(stored.clone());
+    }
+    // No expiry on record means the vendor never gave one, so this is not a sign-in of
+    // ours: a pasted token lives as long as it lives, and there is nothing to refresh it
+    // with either.
+    if *expires_at == 0 {
+        return Ok(stored.clone());
+    }
+    let Some(refresh) = refresh_token.as_deref().filter(|token| !token.is_empty()) else {
+        // A sign-in that carried no refresh token has run out: say so rather than
+        // reporting the same expired token as a network failure.
+        return Err("the signed-in Codex token expired; sign in again from setup".into());
+    };
+    let spec = oauth_spec(ProviderId::Codex).ok_or("no Codex sign-in is known")?;
+    let (status, body) = post_token(
+        spec.token,
+        &[("Content-Type", "application/x-www-form-urlencoded")],
+        &form_body(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", spec.client_id),
+            ("scope", "openid profile email"),
+        ]),
+    )?;
+    let Some(access) = body.get("access_token").and_then(Value::as_str) else {
+        return Err(refused(status, &body));
+    };
+    let refresh = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .unwrap_or(refresh);
+    credentials::record(
+        account,
+        store,
+        stored,
+        Credential::CodexTokens {
+            access_token: access.to_string(),
+            // A refresh answer carries a fresh id_token, and with it the account.
+            account_id: body
+                .get("id_token")
+                .and_then(Value::as_str)
+                .and_then(codex_account_id)
+                .or_else(|| account_id.clone()),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: now + expires_in_ms(&body),
+        },
+    )
+}
 
 fn codex(credential: &Credential, origin: Option<&Path>, live_only: bool) -> Result<Report> {
     let Credential::CodexTokens {
@@ -808,10 +1043,14 @@ fn cursor(credential: &Credential) -> Result<Report> {
 
 /// The dashboard cookie is `sub::jwt`, and `cursor-auth.json` only ships the jwt.
 fn jwt_claim(token: &str, claim: &str) -> Option<String> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64url_decode(payload)?;
-    let doc: Value = serde_json::from_slice(&bytes).ok()?;
-    doc.get(claim)?.as_str().map(str::to_string)
+    jwt_payload(token)?.get(claim)?.as_str().map(str::to_string)
+}
+
+/// The claims of a JWT, without checking its signature: these are tokens the vendor just
+/// handed us over TLS, read for the account they name rather than trusted for anything.
+fn jwt_payload(token: &str) -> Option<Value> {
+    let bytes = base64url_decode(token.split('.').nth(1)?)?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn base64url_decode(input: &str) -> Option<Vec<u8>> {
@@ -841,7 +1080,9 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn urlencode(input: &str) -> String {
+/// Percent-encode everything outside the unreserved set. Shared with the sign-in, whose
+/// scopes and redirects carry characters a query string cannot.
+pub(crate) fn urlencode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 3);
     for byte in input.bytes() {
         match byte {
@@ -1076,10 +1317,21 @@ pub fn fetch_with(account: &AccountRef, store: &dyn CredentialStore, mode: Mode)
         Ok(stored) => stored,
         Err(why) => return failed(why),
     };
-    let stored = if account.provider == ProviderId::Claude && mode == Mode::Poll {
-        match rotate_claude(account, store, &stored) {
-            Ok(stored) => stored,
-            Err(why) => return failed(why),
+    let stored = if mode == Mode::Poll {
+        // A credential the CLI owns is the CLI's to rotate; one this tool signed in for
+        // is ours to keep alive.
+        match account.provider {
+            ProviderId::Claude => match rotate_claude(account, store, &stored) {
+                Ok(stored) => stored,
+                Err(why) => return failed(why),
+            },
+            ProviderId::Codex if stored.origin.is_none() => {
+                match rotate_codex(account, store, &stored) {
+                    Ok(stored) => stored,
+                    Err(why) => return failed(why),
+                }
+            }
+            _ => stored,
         }
     } else {
         stored
@@ -1403,6 +1655,85 @@ mod tests {
         assert_eq!(jwt_claim("not-a-jwt", "sub"), None);
     }
 
+    /// The sign-in is only as good as these two constants: a client id or redirect this
+    /// file invented would be refused in the browser, where nothing can be done about it.
+    #[test]
+    fn the_sign_in_specs_match_the_clients_they_belong_to() {
+        let codex = oauth_spec(ProviderId::Codex).unwrap();
+        assert_eq!(codex.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert_eq!(codex.redirect, "http://localhost:1455/auth/callback");
+        assert_eq!(codex.callback_port, Some(1455));
+        assert!(
+            codex.scopes.contains("offline_access"),
+            "a refresh needs it"
+        );
+        assert!(codex
+            .extra
+            .iter()
+            .any(|(k, _)| *k == "codex_cli_simplified_flow"));
+
+        let claude = oauth_spec(ProviderId::Claude).unwrap();
+        assert_eq!(claude.client_id, CLAUDE_OAUTH_CLIENT_ID);
+        assert_eq!(claude.redirect, CLAUDE_OAUTH_REDIRECT);
+        // Claude's page shows the code instead of calling back, so nothing listens.
+        assert_eq!(claude.callback_port, None);
+        // The refresh endpoint the rest of this file already uses, so a signed-in pair
+        // and an imported one rotate the same way.
+        assert_eq!(claude.token, "https://console.anthropic.com/v1/oauth/token");
+
+        // The providers that have no sign-in say so rather than offering a dead key.
+        assert!(oauth_spec(ProviderId::Cursor).is_none());
+        assert!(oauth_spec(ProviderId::Grok).is_none());
+    }
+
+    /// A signed-in Codex pair names its account in the id_token, which is the only place
+    /// the vendor puts it, and which every usage call has to send back.
+    #[test]
+    fn the_codex_account_comes_out_of_the_id_token() {
+        let claims = serde_json::json!({
+            "sub": "user-1",
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acc_9", "chatgpt_plan_type": "plus"}
+        });
+        let payload = oauth::base64url(&serde_json::to_vec(&claims).unwrap());
+        assert_eq!(
+            codex_account_id(&format!("header.{payload}.sig")).as_deref(),
+            Some("acc_9")
+        );
+        // A token without the claim, or without a payload at all, names no account.
+        assert!(codex_account_id("header.e30.sig").is_none());
+        assert!(codex_account_id("not-a-jwt").is_none());
+    }
+
+    /// A token response with no token in it reports the vendor's reason, not a panic or
+    /// a blank error.
+    #[test]
+    fn a_refused_exchange_keeps_the_vendors_words() {
+        assert_eq!(
+            refused(
+                400,
+                &serde_json::json!({"error": {"type": "invalid_grant", "message": "code expired"}})
+            ),
+            "the sign-in was refused: code expired"
+        );
+        assert_eq!(
+            refused(400, &serde_json::json!({"error": "invalid_client"})),
+            "the sign-in was refused: invalid_client"
+        );
+        assert_eq!(
+            refused(500, &serde_json::json!({})),
+            "the sign-in was refused: HTTP 500"
+        );
+        // The refresh path says the same thing about the same answer.
+        assert_eq!(
+            refusal_reason(
+                401,
+                &serde_json::json!({"error": {"message": "token expired"}})
+            ),
+            "token expired"
+        );
+        assert_eq!(refusal_reason(429, &serde_json::json!({})), "HTTP 429");
+    }
+
     #[test]
     fn credit_counts_stay_readable() {
         assert_eq!(compact(187091.0), "187k");
@@ -1453,6 +1784,53 @@ mod tests {
         let panel: Vec<&Fact> = report.facts.iter().filter(|f| f.panel).collect();
         assert_eq!(panel.len(), 1);
         assert_eq!(panel[0].label, "banked resets");
+    }
+
+    /// Only a credential the vendor gave an expiry for is refreshed, and only a sign-in
+    /// of ours is ever spent on a refresh token.
+    #[test]
+    fn only_a_signed_in_codex_pair_is_refreshed() {
+        let account = AccountRef::new("codex", ProviderId::Codex);
+        let store = MemoryStore::new();
+
+        // A pasted token: usable, with no expiry to judge and no refresh token to spend.
+        let pasted = StoredCredential::new(Credential::CodexTokens {
+            access_token: "pasted".into(),
+            account_id: None,
+            refresh_token: None,
+            expires_at: 0,
+        });
+        store.put("codex", pasted.clone()).unwrap();
+        assert_eq!(
+            rotate_codex(&account, &store, &pasted).unwrap().secret,
+            pasted.secret,
+            "a pasted token must be left alone"
+        );
+
+        // A sign-in that still has time on it is left alone too.
+        let fresh = StoredCredential::new(Credential::CodexTokens {
+            access_token: "fresh".into(),
+            account_id: Some("acc".into()),
+            refresh_token: Some("rt".into()),
+            expires_at: Utc::now().timestamp_millis() + 3_600_000,
+        });
+        store.put("codex", fresh.clone()).unwrap();
+        assert_eq!(
+            rotate_codex(&account, &store, &fresh).unwrap().secret,
+            fresh.secret
+        );
+
+        // An expired sign-in with no refresh token says what to do about it, rather than
+        // failing the account for good with no explanation.
+        let spent = StoredCredential::new(Credential::CodexTokens {
+            access_token: "spent".into(),
+            account_id: None,
+            refresh_token: None,
+            expires_at: Utc::now().timestamp_millis() - 1000,
+        });
+        assert!(rotate_codex(&account, &store, &spent)
+            .unwrap_err()
+            .contains("sign in again"));
     }
 
     #[test]

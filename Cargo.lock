@@ -2024,12 +2024,12 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "crossterm",
+ "getrandom 0.3.4",
  "ratatui",
  "rusqlite",
  "serde",
  "serde_json",
- "unicode-segmentation",
- "unicode-width",
+ "sha2",
  "ureq",
 ]
 

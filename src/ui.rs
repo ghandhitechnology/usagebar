@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -44,13 +44,16 @@ pub struct App {
     pub detected_store: Option<Arc<MemoryStore>>,
     /// Anything the user should hear about at startup, e.g. an unreadable config.
     pub boot_note: Option<String>,
+    /// Token history read from the local CLIs' logs; `None` until the first scan lands.
+    pub usage: Option<crate::usage::Usage>,
     pub overlay: Option<Overlay>,
 }
 
 /// The modal screens. One at a time; the base view owns every key when this is None.
 pub enum Overlay {
     Settings(Settings),
-    Wizard(Wizard),
+    /// Boxed: the wizard is the one overlay with a whole form's state in it.
+    Wizard(Box<Wizard>),
     Detail(crate::detail::Detail),
 }
 
@@ -81,6 +84,8 @@ impl Overlay {
             Overlay::Settings(settings) => {
                 if let Some(input) = settings.editing.as_mut() {
                     input.paste(text);
+                } else if let Some(rename) = settings.renaming.as_mut() {
+                    rename.input.paste(text);
                 }
             }
             Overlay::Wizard(wizard) => wizard.paste(text),
@@ -132,6 +137,7 @@ impl App {
             file_store,
             detected_store: None,
             boot_note: None,
+            usage: None,
             overlay: None,
         }
     }
@@ -247,15 +253,17 @@ const TRACK: Color = Color::Rgb(0x33, 0x36, 0x3D);
 /// opencode dims its own settings screen to this same ratio.
 const BACKDROP: u16 = 41;
 
+/// One colour per vendor, shared by the panels and the usage chart so a provider reads
+/// the same wherever it is drawn.
 pub(crate) fn provider_color(provider: ProviderId) -> Color {
     match provider {
         ProviderId::Claude => Color::Rgb(0xD9, 0x77, 0x57),
-        ProviderId::Codex => Color::Rgb(0x4F, 0xB8, 0x9A),
-        ProviderId::OpenCodeGo => Color::Rgb(0x7A, 0xA2, 0xF7),
+        ProviderId::Codex => Color::Rgb(0x5B, 0x8D, 0xEF),
+        ProviderId::OpenCodeGo => Color::Rgb(0x2E, 0x5A, 0xA8),
         ProviderId::Cursor => Color::Rgb(0xB9, 0xC2, 0xD6),
         ProviderId::Grok => Color::Rgb(0x9C, 0xA3, 0xAF),
-        ProviderId::Devin => Color::Rgb(0x6E, 0x9E, 0xE8),
-        ProviderId::CommandCode => Color::Rgb(0xE0, 0xA8, 0x5E),
+        ProviderId::Devin => Color::Rgb(0xF0, 0xF2, 0xF5),
+        ProviderId::CommandCode => Color::Rgb(0xA8, 0x7B, 0xF0),
     }
 }
 
@@ -431,16 +439,16 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
             report
                 .windows
                 .iter()
-                .map(|window| (window.used_percent, report.provider, window))
+                .map(|window| (window.used_percent, report, window))
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         })
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut second = vec![Span::styled("  ", Style::default()), status];
-    if let Some((percent, provider, window)) = tightest {
+    if let Some((percent, report, window)) = tightest {
         second.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
         second.push(Span::styled(
-            format!("{} {} ", provider, window.label),
+            format!("{} {} ", report.name(), window.label),
             Style::default().fg(TEXT),
         ));
         second.push(Span::styled(
@@ -620,19 +628,283 @@ fn grid(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    let used = heights.iter().map(|h| *h as usize).sum::<usize>() as u16;
+    let tail = Rect {
+        y: area.y + used,
+        height: area.height.saturating_sub(used),
+        ..area
+    };
+
     if hidden > 0 {
-        let used = heights.iter().map(|h| *h as usize).sum::<usize>() as u16;
-        let y = area.y + used;
-        if y < area.y + area.height {
+        if tail.height > 0 {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!("+{hidden} more — enlarge the pane"),
                     Style::default().fg(FAINT),
                 ))),
-                Rect { y, ..area },
+                tail,
             );
         }
+        return;
     }
+    usage_chart(frame, app, tail);
+}
+
+/// Tokens per day, drawn as a layered area that fills whatever the cards left behind.
+/// Two accounts of one vendor land in the same band and keep the vendor's colour.
+fn usage_chart(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height < 4 || area.width < 40 {
+        return;
+    }
+    let note = |frame: &mut Frame, text: String| {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(FAINT)))),
+            area,
+        );
+    };
+    let Some(usage) = &app.usage else {
+        return note(frame, " reading local session logs…".into());
+    };
+    let columns = usage.columns(Local::now().date_naive(), crate::usage::WINDOW_DAYS);
+    let totals = usage.totals();
+    if totals.is_empty() {
+        return note(
+            frame,
+            format!(
+                " no tokens recorded in the last {} days",
+                crate::usage::WINDOW_DAYS
+            ),
+        );
+    }
+
+    let axis = area.height >= 5;
+    let rows = (area.height.saturating_sub(1 + u16::from(axis))).clamp(2, 30) as usize;
+    let width = area.width as usize;
+
+    // Day values in stack order, so a band keeps its colour for the whole chart
+    // instead of trading places with its neighbours day by day.
+    let values: Vec<Vec<u64>> = columns
+        .iter()
+        .map(|column| {
+            order_of(&totals)
+                .iter()
+                .map(|provider| {
+                    column
+                        .parts
+                        .iter()
+                        .find(|(candidate, _)| candidate == provider)
+                        .map(|(_, tokens)| *tokens)
+                        .unwrap_or(0)
+                })
+                .collect()
+        })
+        .collect();
+    let colors: Vec<(Color, Color)> = order_of(&totals)
+        .iter()
+        .map(|provider| {
+            let base = provider_color(*provider);
+            (base, lighten(base, 0.45))
+        })
+        .collect();
+
+    let mut lines = vec![Line::from(chart_title(&totals, width))];
+    lines.extend(plot_lines(
+        &values,
+        &colors,
+        peak_of(&columns),
+        rows * 2,
+        width,
+    ));
+    if axis {
+        lines.push(Line::from(chart_axis(&columns, width)));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn order_of(totals: &[(ProviderId, u64)]) -> Vec<ProviderId> {
+    totals.iter().map(|(provider, _)| *provider).collect()
+}
+
+fn peak_of(columns: &[crate::usage::Column]) -> f64 {
+    columns
+        .iter()
+        .map(|column| column.total)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64
+}
+
+/// The plot itself. Half blocks give every character cell two pixel rows, and the days
+/// are interpolated so the area flows between them instead of stepping. Runs of
+/// identical cells merge into one span, so a frame costs a few dozen strings.
+fn plot_lines(
+    values: &[Vec<u64>],
+    colors: &[(Color, Color)],
+    peak: f64,
+    px: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let days = values.len();
+    // Cumulative band heights in pixel rows for every column of the plot.
+    let bounds: Vec<Vec<f32>> = (0..width)
+        .map(|x| {
+            let at = x as f64 / (width - 1).max(1) as f64 * (days - 1).max(1) as f64;
+            let left = (at as usize).min(days - 1);
+            let right = (left + 1).min(days - 1);
+            let frac = (at - left as f64) as f32;
+            let mut cum = Vec::with_capacity(colors.len());
+            let mut sum = 0.0f32;
+            for (index, _) in colors.iter().enumerate() {
+                let before = values[left][index] as f32;
+                let after = values[right][index] as f32;
+                sum += before + (after - before) * frac;
+                cum.push(sum / peak as f32 * px as f32);
+            }
+            cum
+        })
+        .collect();
+
+    let mut lines = Vec::with_capacity(px / 2);
+    for cell_row in 0..px / 2 {
+        let y_up = (px - 2 * cell_row - 1) as f32;
+        let y_lo = y_up - 1.0;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run: Option<(&'static str, Color, Option<Color>, usize)> = None;
+        for column in bounds.iter() {
+            let cell = half_cell(band_at(column, y_up, colors), band_at(column, y_lo, colors));
+            match run.as_mut() {
+                Some((run_glyph, run_fg, run_bg, run_width))
+                    if *run_glyph == cell.0 && *run_fg == cell.1 && *run_bg == cell.2 =>
+                {
+                    *run_width += 1;
+                }
+                _ => {
+                    flush_run(&mut run, &mut spans);
+                    run = Some((cell.0, cell.1, cell.2, 1));
+                }
+            }
+        }
+        flush_run(&mut run, &mut spans);
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// One pixel of the plot: the band that owns it, wearing its bright edge when it is the
+/// top of the whole stack.
+#[derive(Clone, Copy, PartialEq)]
+struct Pixel {
+    color: Color,
+}
+
+fn band_at(cum: &[f32], y: f32, colors: &[(Color, Color)]) -> Option<Pixel> {
+    let center = y + 0.5;
+    let total = cum.last().copied().unwrap_or(0.0);
+    if center > total {
+        return None;
+    }
+    for (index, top) in cum.iter().enumerate() {
+        if center <= *top {
+            let (base, edge) = colors[index];
+            let color = if center > total - 1.0 { edge } else { base };
+            return Some(Pixel { color });
+        }
+    }
+    None
+}
+
+/// Two stacked pixels become one glyph: a full block when they agree, half blocks when
+/// they differ, and blank where the plot is not.
+fn half_cell(up: Option<Pixel>, lo: Option<Pixel>) -> (&'static str, Color, Option<Color>) {
+    match (up, lo) {
+        (Some(up), Some(lo)) if up.color == lo.color => ("█", up.color, None),
+        (Some(up), Some(lo)) => ("▀", up.color, Some(lo.color)),
+        (Some(up), None) => ("▀", up.color, None),
+        (None, Some(lo)) => ("▄", lo.color, None),
+        (None, None) => (" ", TEXT, None),
+    }
+}
+
+/// Pull a colour toward white for the bright edge a stack wears along its top.
+fn lighten(color: Color, amount: f32) -> Color {
+    let blend = |channel: u8| (channel as f32 + (255.0 - channel as f32) * amount) as u8;
+    match color {
+        Color::Rgb(red, green, blue) => Color::Rgb(blend(red), blend(green), blend(blue)),
+        other => other,
+    }
+}
+
+fn flush_run(
+    run: &mut Option<(&'static str, Color, Option<Color>, usize)>,
+    spans: &mut Vec<Span<'static>>,
+) {
+    if let Some((glyph, fg, bg, count)) = run.take() {
+        let mut style = Style::default().fg(fg);
+        if let Some(bg) = bg {
+            style = style.bg(bg);
+        }
+        spans.push(Span::styled(glyph.repeat(count), style));
+    }
+}
+
+/// The chart's own line: what it shows on the left, who is in the stack on the right.
+fn chart_title(totals: &[(ProviderId, u64)], width: usize) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!(" Tokens · last {} days ", crate::usage::WINDOW_DAYS),
+        Style::default().fg(DIM),
+    )];
+    let mut legend: Vec<Span<'static>> = Vec::new();
+    for (index, (provider, tokens)) in totals.iter().enumerate() {
+        if index > 0 {
+            legend.push(Span::raw("  "));
+        }
+        legend.push(Span::styled(
+            "● ",
+            Style::default().fg(provider_color(*provider)),
+        ));
+        legend.push(Span::styled(
+            format!("{} {}", provider.display(), crate::usage::compact(*tokens)),
+            Style::default().fg(DIM),
+        ));
+    }
+    let used: usize = spans.iter().map(|span| span.width()).sum();
+    let legend_width: usize = legend.iter().map(|span| span.width()).sum();
+    spans.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + legend_width)),
+    ));
+    spans.extend(legend);
+    spans
+}
+
+/// The day range under the plot, with the busiest day called out between them.
+fn chart_axis(columns: &[crate::usage::Column], width: usize) -> Vec<Span<'static>> {
+    let first = columns.first().map(|column| column.day).unwrap_or_default();
+    let last = columns.last().map(|column| column.day).unwrap_or_default();
+    let left = format!(" {}", first.format("%b %-d"));
+    let right = format!("{} ", last.format("%b %-d"));
+    let middle = columns
+        .iter()
+        .max_by_key(|column| column.total)
+        .filter(|column| column.total > 0)
+        .map(|column| {
+            format!(
+                "peak {} on {}",
+                crate::usage::compact(column.total),
+                column.day.format("%b %-d")
+            )
+        })
+        .unwrap_or_default();
+    let span = width.saturating_sub(left.chars().count() + right.chars().count());
+    let middle_width = middle.chars().count();
+    let lead = span.saturating_sub(middle_width) / 2;
+    vec![
+        Span::styled(left, Style::default().fg(FAINT)),
+        Span::raw(" ".repeat(lead)),
+        Span::styled(middle, Style::default().fg(FAINT)),
+        Span::raw(" ".repeat(span.saturating_sub(lead + middle_width))),
+        Span::styled(right, Style::default().fg(FAINT)),
+    ]
 }
 
 /// Picks the densest drawing that still fits the pane, then drops whole rows that will not
@@ -737,7 +1009,7 @@ fn row_line(frame: &mut Frame, report: &Report, area: Rect) {
     });
 
     let mut spans = vec![Span::styled(
-        pad(report.provider.display(), name_width),
+        pad(&report.name(), name_width),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
 
@@ -785,14 +1057,18 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
     let healthy = matches!(report.health, Health::Ok | Health::Stale { .. });
 
     let mut title = vec![Span::styled(
-        format!(" {} ", report.provider.display()),
+        format!(" {} ", report.name()),
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )];
-    if let Some(name) = report.label.clone().or_else(|| report.account.clone()) {
-        title.push(Span::styled(
-            format!("{} ", crate::model::short_account(&name)),
-            Style::default().fg(FAINT),
-        ));
+    // Only an account without a name of its own needs the vendor's own account name
+    // beside it, to tell two logins of one provider apart.
+    if report.label.is_none() {
+        if let Some(vendor) = &report.account {
+            title.push(Span::styled(
+                format!("{} ", crate::model::short_account(vendor)),
+                Style::default().fg(FAINT),
+            ));
+        }
     }
     let badge = match (&report.plan, &report.health) {
         (Some(plan), _) => Span::styled(format!(" {} ", plan), Style::default().fg(DIM)),
@@ -1015,34 +1291,85 @@ mod tests {
         }
     }
 
+    /// The name the user gave the account titles the panel; the provider's own name
+    /// steps aside instead of being printed next to it.
     #[test]
-    fn repeated_failures_keep_the_original_stale_time() {
+    fn a_named_account_titles_its_panel() {
         let mut app = test_app();
         app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
-        let mut good = Report::new(ProviderId::Claude).key("claude");
-        good.windows.push(Window::new("Weekly", 42.0));
-        app.absorb(vec![good]);
+        let mut report = Report::new(ProviderId::Claude)
+            .key("claude")
+            .label(Some("Chatgpt".into()));
+        report.windows.push(Window::new("Weekly", 42.0));
+        app.absorb(vec![report]);
 
-        app.absorb(vec![
-            Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")
-        ]);
-        let first_since = match app.reports[0].health {
-            Health::Stale { since, .. } => since,
-            ref other => panic!("expected stale, got {other:?}"),
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Chatgpt"));
+        assert!(!text.contains("Claude"));
+    }
+
+    /// The chart fills the space the cards leave behind, and a day's column is stacked
+    /// with the colour of whoever spent the tokens.
+    #[test]
+    fn the_usage_chart_fills_the_space_under_the_cards() {
+        let mut app = test_app();
+        app.accounts = vec![AccountRef::new("codex", ProviderId::Codex)];
+        let mut report = Report::new(ProviderId::Codex).key("codex");
+        report.windows.push(Window::new("Weekly", 10.0));
+        app.absorb(vec![report]);
+
+        let mut usage = crate::usage::Usage::default();
+        let today = Local::now().date_naive();
+        usage.add(today, ProviderId::Codex, 1_000_000);
+        usage.add(today, ProviderId::Claude, 500_000);
+        app.usage = Some(usage);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Tokens · last 21 days"));
+        // Both vendors are named in the legend, with what they spent, and the busiest
+        // day is called out under the plot.
+        assert!(text.contains("Codex 1.0M"));
+        assert!(text.contains("Claude 500k"));
+        assert!(text.contains("peak 1.5M"));
+
+        // Count only what the chart drew: the cards above it share these colours.
+        let width = buffer.area.width as usize;
+        let chart: Vec<&ratatui::buffer::Cell> = buffer
+            .content()
+            .chunks(width)
+            .skip_while(|row| {
+                !row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("Tokens · last")
+            })
+            .flatten()
+            .collect();
+        let cells = |color: Color| {
+            chart
+                .iter()
+                .filter(|cell| cell.fg == color && matches!(cell.symbol(), "█" | "▀" | "▄"))
+                .count()
         };
-
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        app.absorb(vec![Report::failed(
-            ProviderId::Claude,
-            "still offline".into(),
-        )
-        .key("claude")]);
-        let second_since = match app.reports[0].health {
-            Health::Stale { since, .. } => since,
-            ref other => panic!("expected stale, got {other:?}"),
-        };
-
-        assert_eq!(second_since, first_since);
+        let codex = cells(provider_color(ProviderId::Codex));
+        let claude = cells(provider_color(ProviderId::Claude));
+        assert!(codex > 0 && claude > 0, "both vendors are drawn");
+        // Codex spent twice what Claude did, so its slice of the stack is the taller one.
+        assert!(codex > claude, "codex {codex} cells, claude {claude}");
     }
 
     /// Two accounts of one provider are two panels, so one account's reading must not

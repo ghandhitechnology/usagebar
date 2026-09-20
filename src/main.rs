@@ -4,10 +4,12 @@ mod detail;
 mod fsutil;
 mod input;
 mod model;
+mod oauth;
 mod providers;
 mod render;
 mod settings;
 mod ui;
+mod usage;
 mod wizard;
 
 use std::io::{IsTerminal, Write};
@@ -77,6 +79,7 @@ fn main() -> std::io::Result<()> {
         let (accounts, store) = boot(&config, &file_store);
         let mut app = App::new(interval, store, sort_mode(&config), Arc::clone(&file_store));
         app.accounts = accounts;
+        app.usage = Some(usage::scan(Utc::now()));
         app.absorb(providers::fetch_all(
             &app.accounts,
             &app.store,
@@ -214,10 +217,7 @@ fn table(reports: &[Report]) -> String {
     let mut out = String::new();
     for report in reports {
         let plan = report.plan.clone().unwrap_or_default();
-        let name = match &report.label {
-            Some(label) => format!("{} · {label}", report.provider.display()),
-            None => report.provider.display().to_string(),
-        };
+        let name = report.name();
         out.push_str(&format!("{} {}\n", name, plan));
         match &report.health {
             Health::Ok => {}
@@ -299,7 +299,15 @@ fn run_tui(
 
     let (tx, rx) = mpsc::channel::<RefreshEvent>();
     let (scan_tx, scan_rx) = mpsc::channel::<Vec<providers::Detected>>();
-    let mut refresh = RefreshGate::default();
+    // The token history is read off the local logs, which are big enough that it is
+    // spoiling its own thread. Daily columns do not need to be fresher than this.
+    let (usage_tx, usage_rx) = mpsc::channel::<usage::Usage>();
+    std::thread::spawn(move || loop {
+        if usage_tx.send(usage::scan(Utc::now())).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(300));
+    });
     let scanning = if app.accounts.is_empty() {
         std::thread::spawn(move || {
             let _ = scan_tx.send(providers::detect());
@@ -324,7 +332,10 @@ fn run_tui(
                 app.detected_store = Some(detected_store);
                 // Nothing saved yet means this is the first run; offer setup.
                 if !app.persisted && app.overlay.is_none() {
-                    app.overlay = Some(Overlay::Wizard(Wizard::new(detected, app.config.sort)));
+                    app.overlay = Some(Overlay::Wizard(Box::new(Wizard::new(
+                        detected,
+                        app.config.sort,
+                    ))));
                 }
                 request_refresh(&mut refresh, &tx, &mut app);
                 last_trigger = Instant::now();
@@ -340,6 +351,9 @@ fn run_tui(
                     }
                 }
             }
+        }
+        if let Ok(usage) = usage_rx.try_recv() {
+            app.usage = Some(usage);
         }
         let due = !app.paused && last_trigger.elapsed() >= Duration::from_secs(app.interval_secs);
         if due && !app.accounts.is_empty() {
@@ -397,8 +411,9 @@ fn run_tui(
                                 last_trigger = Instant::now();
                             }
                             OverlayAction::OpenWizard => {
-                                app.overlay =
-                                    Some(Overlay::Wizard(Wizard::new_add(app.config.sort)));
+                                app.overlay = Some(Overlay::Wizard(Box::new(Wizard::new_add(
+                                    app.config.sort,
+                                ))));
                             }
                         }
                     } else {

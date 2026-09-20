@@ -76,6 +76,19 @@ impl ProviderId {
             ProviderId::CommandCode => "Command Code",
         }
     }
+
+    /// One line on how this provider is connected, shown while picking a provider.
+    pub fn connect_hint(self) -> &'static str {
+        match self {
+            ProviderId::Claude => "browser sign-in, a pasted token pair, or Claude Code's file",
+            ProviderId::Codex => "browser sign-in, a pasted token, or the Codex CLI's auth.json",
+            ProviderId::OpenCodeGo => "a Go API key, pasted here or from the store",
+            ProviderId::Cursor => "the access token from cursor-agent's auth.json",
+            ProviderId::Grok => "the session key from the Grok CLI's auth.json",
+            ProviderId::Devin => "the windsurf_api_key from Devin's credentials.toml",
+            ProviderId::CommandCode => "the API key from the Command Code CLI's auth.json",
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderId {
@@ -118,6 +131,14 @@ impl AccountRef {
     pub fn problem(mut self, problem: impl Into<String>) -> Self {
         self.problem = Some(problem.into());
         self
+    }
+
+    /// What this account is called: the name the user gave it, or the provider's own
+    /// name standing in until they give it one.
+    pub fn name(&self) -> String {
+        self.label
+            .clone()
+            .unwrap_or_else(|| self.provider.display().to_string())
     }
 }
 
@@ -244,6 +265,13 @@ impl Report {
     pub fn label(mut self, label: Option<String>) -> Self {
         self.label = label;
         self
+    }
+
+    /// The account's name, read off the report so a panel can title itself with it.
+    pub fn name(&self) -> String {
+        self.label
+            .clone()
+            .unwrap_or_else(|| self.provider.display().to_string())
     }
 
     pub fn account(mut self, account: Option<String>) -> Self {

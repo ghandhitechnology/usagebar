@@ -11,11 +11,11 @@ instead of inventing a figure.
 
 | Provider | Source | Credential |
 | --- | --- | --- |
-| Claude Code subscription | `GET api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | OAuth pair from `~/.claude/.credentials.json`, refreshed and written back in place |
-| Codex with ChatGPT login | `GET chatgpt.com/backend-api/wham/usage`; falls back to the last `rate_limits` snapshot in `~/.codex/sessions` | `~/.codex/auth.json` |
-| OpenCode Go | `GET opencode.ai/zen/go/v1/usage` per key | `credential` table in `~/.local/share/opencode/opencode.db` |
-| Cursor individual usage | `GET cursor.com/api/usage-summary` | `~/.cursor/auth.json`, cookie built as `sub::jwt` |
-| Grok CLI | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` | `~/.grok/auth.json` |
+| Claude | `GET api.anthropic.com/api/oauth/usage` (`anthropic-beta: oauth-2025-04-20`) | a browser sign-in, a pasted OAuth pair, or `~/.claude/.credentials.json`, refreshed and written back in place |
+| Codex | `GET chatgpt.com/backend-api/wham/usage`; falls back to the last `rate_limits` snapshot in `~/.codex/sessions` | a browser sign-in, a pasted token, or `~/.codex/auth.json` |
+| OpenCode Go | `GET opencode.ai/zen/go/v1/usage` per key | the `credential` table in `~/.local/share/opencode/opencode.db`, or a Go key pasted by hand |
+| Cursor | `GET cursor.com/api/usage-summary` | `~/.cursor/auth.json`, cookie built as `sub::jwt` |
+| Grok | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` | `~/.grok/auth.json` |
 | Devin | `POST server.codeium.com/.../GetUserStatus` (Connect RPC), remaining flipped to used | `windsurf_api_key` in `~/.local/share/devin/credentials.toml` |
 | Command Code | `GET api.commandcode.ai/alpha/billing/credits` | `~/.commandcode/auth.json` |
 
@@ -26,8 +26,10 @@ file never holds one.
 
 ## Setup
 
-The first run scans the machine and opens with the logins it found. `space` includes or
-excludes one, `a` connects another provider, and enter goes to the finish screen.
+The first run scans the machine and opens with what it found. `space` toggles a credential,
+`a` connects a provider by hand, enter goes to the finish screen — except on a row the scan
+could not make a credential out of, where enter opens that provider's connect screen so one
+can be typed in.
 
 For providers with a local CLI, setup starts with that provider's normal saved login path.
 Sign in with the provider's own CLI, then press enter to check the account. Raw token entry
@@ -36,6 +38,29 @@ is under `F2` Advanced. OpenCode Go uses its API key because it has no login fil
 Every manual connection is checked against the vendor before it saves. If a check fails,
 enter retries it; `ctrl+s` is the explicit way to keep the account unchecked. A check only
 reads: it never refreshes or rewrites a credential.
+
+OpenCode Go is the one provider with no credential file of its own. The scan reads the keys
+in the OpenCode store and keeps the ones the Go endpoint answers for; any other Go key — a
+second subscription, one bought elsewhere, one OpenCode has never seen — is pasted into its
+connect screen instead, and becomes an account of its own, with the same per-window numbers
+and the same name field as every other account.
+
+### Signing in with a browser
+
+Claude and Codex also have a sign-in, on the "sign in with a browser" row at the top of
+their connect screens, for an account that is not signed in on this machine at all. It uses
+the same client each vendor's own CLI uses, and the same flow:
+
+- **Codex** serves the browser's callback on `localhost:1455`, so the credential arrives on
+  its own; the account id comes out of the id_token and is sent with every usage call.
+- **Claude** has no loopback redirect, so its page shows a code; paste it into the sign-in
+  field (`code#state` is fine, the code is the part before the hash) and press enter.
+
+Either way the credential is read back once before the screen says it worked, and it is
+stored like any other — there is no file behind it. A signed-in Codex pair is refreshed when
+it expires, because rotating it is the only way that connection stays alive; a pair imported
+from the Codex CLI is never touched, since the CLI rotates its own and would otherwise be
+signed out from under the user.
 
 Nothing is written until the finish screen. Esc skips setup and records that choice as
 `"detect": true` with an empty account list, which means "keep scanning each run"; removing
@@ -60,7 +85,8 @@ while keeping the selected row visible.
 ## Accounts and order
 
 One account is one panel. Two Claude logins, or two OpenCode Go keys, are two panels with
-their own readings and history.
+their own readings and history. An account goes by its provider's name until it is renamed;
+the name given replaces the provider's in the list, the panel titles and the header.
 
 `s` lists accounts in display order:
 
@@ -68,6 +94,7 @@ their own readings and history.
 | --- | --- |
 | `space` | show or hide the account |
 | `shift+↑` `shift+↓` | move it |
+| `r` | rename it; the name replaces the provider's everywhere, an empty name puts the provider's back |
 | `x` | remove it, twice, because that forgets its credentials |
 | `enter` | on a setting, change it |
 
@@ -90,6 +117,21 @@ make them:
 
 `USAGEBAR_CONFIG_DIR` moves both files somewhere else. With no accounts configured, every
 run scans the vendor files, which is what the tool did before accounts existed.
+
+## Token graph
+
+When the pane is taller than the cards need, the space under them holds a token graph: a
+layered area, one band per provider for the last three weeks, drawn at two pixel rows per
+character cell with the days interpolated so it flows instead of stepping. The window's
+totals sit beside the title, and the busiest day is called out on the axis.
+
+It is read from the CLIs' own logs, not from the vendors: Claude Code's transcripts under
+`~/.claude/projects`, Codex's rollouts under `~/.codex/sessions`, and the OpenCode
+database's `opencode-go` messages. Accounts of one provider share a band and a colour,
+since the question the graph answers is which vendor the tokens went to. A vendor that
+keeps no local token log — Cursor, Grok, Devin, Command Code — has nothing to draw.
+The scan runs on its own thread at startup and every five minutes; the window looks 21
+days back, and logs untouched since then are never opened.
 
 ## Install
 
