@@ -251,6 +251,11 @@ fn claude(credential: &Credential) -> Result<Report> {
     if status == 401 || status == 403 {
         return Err("token rejected; run any Claude Code command, usagebar will pick it up".into());
     }
+    if status == 429 {
+        // The usage endpoint can stay rate limited for hours while the token itself is
+        // fine. Every inference reply carries the same session and weekly utilization.
+        return claude_from_headers(access_token, subscription_type);
+    }
     require_success(status)?;
 
     let mut report = Report::new(ProviderId::Claude).plan(subscription_type.clone());
@@ -323,6 +328,66 @@ fn claude(credential: &Credential) -> Result<Report> {
         report.health = Health::NoQuota("no windows reported".into());
     }
     Ok(report)
+}
+
+/// Read utilization from the `anthropic-ratelimit-unified-*` headers of a one-token
+/// Haiku reply. Only the session and weekly windows come back this way.
+fn claude_from_headers(access_token: &str, subscription_type: &Option<String>) -> Result<Report> {
+    let url = "https://api.anthropic.com/v1/messages";
+    let mut res = ureq::post(url)
+        .config()
+        .timeout_global(Some(TIMEOUT))
+        .http_status_as_error(false)
+        .build()
+        .header("User-Agent", UA)
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-version", "2023-06-01")
+        .send_json(serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "messages": [{ "role": "user", "content": "." }],
+        }))
+        .map_err(|e| format!("{url}: {}", transport_error(e)))?;
+    let status = res.status().as_u16();
+    let _ = res.body_mut().read_to_string();
+    if status == 401 || status == 403 {
+        return Err("token rejected; run any Claude Code command, usagebar will pick it up".into());
+    }
+    let headers = res.headers();
+    let report = claude_windows_from_headers(|name| {
+        headers
+            .get(format!("anthropic-ratelimit-unified-{name}"))
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    })
+    .plan(subscription_type.clone());
+    if report.windows.is_empty() {
+        return Err(format!(
+            "usage rate limited, fallback failed (HTTP {status})"
+        ));
+    }
+    Ok(report)
+}
+
+fn claude_windows_from_headers(header: impl Fn(&str) -> Option<String>) -> Report {
+    let mut report = Report::new(ProviderId::Claude);
+    for (key, label) in [("5h", "Session"), ("7d", "Weekly")] {
+        let Some(fraction) =
+            header(&format!("{key}-utilization")).and_then(|raw| raw.trim().parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let reset = header(&format!("{key}-reset"))
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .and_then(epoch_seconds);
+        report
+            .windows
+            .push(Window::new(label, fraction * 100.0).reset_at(reset));
+    }
+    report.notes.push("from rate-limit headers".into());
+    report
 }
 
 /// Refresh an expired Claude pair. Returns the pair to use now, and persists a rotated
@@ -1296,6 +1361,30 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         assert_eq!(keys, vec![("cred_go".into(), "go-secret".into())]);
+    }
+
+    /// The headers carry fractions, not percents, and resets as epoch seconds.
+    #[test]
+    fn claude_header_fallback_reads_fractions_as_percents() {
+        let report = claude_windows_from_headers(|name| {
+            match name {
+                "5h-utilization" => Some("0.03"),
+                "5h-reset" => Some("1790404800"),
+                "7d-utilization" => Some("0.33"),
+                _ => None,
+            }
+            .map(str::to_string)
+        });
+        let windows: Vec<(&str, f64)> = report
+            .windows
+            .iter()
+            .map(|w| (w.label.as_str(), (w.used_percent * 10.0).round() / 10.0))
+            .collect();
+        assert_eq!(windows, vec![("Session", 3.0), ("Weekly", 33.0)]);
+        assert_eq!(
+            report.windows[0].resets_at.map(|at| at.timestamp()),
+            Some(1790404800)
+        );
     }
 
     #[test]

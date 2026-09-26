@@ -162,7 +162,9 @@ from when that file still holds the pair it rotated from, and it re-reads the fi
 every poll, so a login refreshed by Claude Code itself is picked up rather than shadowed.
 
 Provider endpoints are undocumented and rate limited, so keep the interval at a minute or
-more. Polling Claude's usage endpoint every few seconds earns a 429.
+more. Claude's usage endpoint can stay rate limited for hours; while it does, the Claude panel
+reads session and weekly utilization from the rate-limit headers of a one-token Haiku reply,
+and the per-model weekly windows drop out until the endpoint answers again.
 
 `--json` is the integration surface; the schema is `{captured_at, reports[]}` with
 `account_id`, `label`, `facts[]`, and a `health.state` of `ok`, `stale`, `no_quota`, or
