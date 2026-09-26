@@ -248,6 +248,10 @@ pub(crate) const DIM: Color = Color::Rgb(0x6B, 0x6F, 0x7A);
 pub(crate) const FAINT: Color = Color::Rgb(0x3C, 0x40, 0x48);
 pub(crate) const TEXT: Color = Color::Rgb(0xC8, 0xCC, 0xD4);
 const TRACK: Color = Color::Rgb(0x33, 0x36, 0x3D);
+const MAX_CARD_WIDTH: u16 = 92;
+const TWO_COLUMN_MIN: u16 = 102;
+const THREE_COLUMN_MIN: u16 = 204;
+const DETAILED_PERCENT_MIN: usize = 60;
 
 /// How much of a colour survives the backdrop under an open overlay, in percent.
 /// opencode dims its own settings screen to this same ratio.
@@ -267,14 +271,16 @@ pub(crate) fn provider_color(provider: ProviderId) -> Color {
     }
 }
 
-/// Filled-bar ramp, cool when there is headroom and hot when there is not.
+/// Filled-bar colour, with a restrained highlight near the leading edge. Thresholds do
+/// the useful work: green has room, amber is close, orange is tight, and red is critical.
 pub(crate) fn ramp(percent: f64, position: f64) -> Color {
     let (from, to) = match percent {
-        p if p >= 95.0 => ((0xD6, 0x45, 0x45), (0xF2, 0x6B, 0x6B)),
-        p if p >= 85.0 => ((0xE0, 0x7A, 0x5F), (0xF2, 0x9E, 0x7E)),
-        p if p >= 70.0 => ((0xD8, 0xA8, 0x57), (0xEA, 0xC4, 0x72)),
-        _ => ((0x5E, 0xB8, 0x8A), (0x8F, 0xDC, 0xA6)),
+        p if p >= 95.0 => ((0xD6, 0x45, 0x45), (0xEF, 0x68, 0x68)),
+        p if p >= 85.0 => ((0xD6, 0x6D, 0x51), (0xE7, 0x86, 0x68)),
+        p if p >= 70.0 => ((0xC6, 0x95, 0x46), (0xD9, 0xAC, 0x5A)),
+        _ => ((0x4F, 0xA7, 0x7E), (0x74, 0xC9, 0x95)),
     };
+    let position = ((position - 0.75) / 0.25).clamp(0.0, 1.0);
     let mix = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * position) as u8;
     Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
 }
@@ -305,6 +311,14 @@ pub(crate) fn bar_spans(percent: f64, width: usize) -> Vec<Span<'static>> {
         }
     }
     spans
+}
+
+pub(crate) fn percent_text(percent: f64, detailed: bool) -> String {
+    if detailed {
+        format!("{percent:>5.1}%")
+    } else {
+        format!("{percent:>3.0}%")
+    }
 }
 
 pub(crate) fn countdown(reset: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -592,13 +606,10 @@ fn grid(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let columns = match area.width {
-        w if w >= 156 => 3,
-        w if w >= 102 => 2,
-        _ => 1,
-    };
+    let columns = column_count(area.width, app.reports.len());
+    let grid_area = centered_grid(area, columns);
     let rows: Vec<&[Report]> = app.reports.chunks(columns).collect();
-    let (density, heights, hidden) = plan(&rows, area.height, columns);
+    let (density, heights, hidden) = plan(&rows, grid_area.height);
 
     let row_rects = Layout::default()
         .direction(Direction::Vertical)
@@ -608,18 +619,18 @@ fn grid(frame: &mut Frame, app: &App, area: Rect) {
                 .map(|h| Constraint::Length(*h))
                 .collect::<Vec<_>>(),
         )
-        .split(area);
+        .split(grid_area);
 
     for (row_index, row) in rows.iter().take(heights.len()).enumerate() {
-        let rect = row_rects[row_index];
+        let rect = centered_row(row_rects[row_index], columns, row.len());
         if rect.height == 0 {
             continue;
         }
         let cells = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(
-                (0..columns)
-                    .map(|_| Constraint::Ratio(1, columns as u32))
+                (0..row.len())
+                    .map(|_| Constraint::Ratio(1, row.len() as u32))
                     .collect::<Vec<_>>(),
             )
             .split(rect);
@@ -907,21 +918,51 @@ fn chart_axis(columns: &[crate::usage::Column], width: usize) -> Vec<Span<'stati
     ]
 }
 
+fn column_count(width: u16, reports: usize) -> usize {
+    let available = match width {
+        w if w >= THREE_COLUMN_MIN => 3,
+        w if w >= TWO_COLUMN_MIN => 2,
+        _ => 1,
+    };
+    available.min(reports.max(1))
+}
+
+fn centered_grid(area: Rect, columns: usize) -> Rect {
+    let width = area
+        .width
+        .min(MAX_CARD_WIDTH.saturating_mul(columns as u16));
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        width,
+        ..area
+    }
+}
+
+fn centered_row(area: Rect, columns: usize, cards: usize) -> Rect {
+    let card_width = area.width / columns as u16;
+    let width = card_width.saturating_mul(cards as u16);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        width,
+        ..area
+    }
+}
+
 /// Picks the densest drawing that still fits the pane, then drops whole rows that will not
 /// fit rather than letting the layout shrink every panel out of usefulness. Returns the
 /// density, the heights of the rows to draw, and how many panels were held back.
-fn plan(rows: &[&[Report]], height: u16, columns: usize) -> (Density, Vec<u16>, usize) {
-    let outcome = fit_density(rows, height, columns);
+fn plan(rows: &[&[Report]], height: u16) -> (Density, Vec<u16>, usize) {
+    let outcome = fit_density(rows, height);
     // A panel held back without a word is worse than one fewer panel, so re-plan with a row
     // reserved for the notice whenever something had to be dropped.
     match outcome.2 {
         0 => outcome,
-        _ if height >= 3 => fit_density(rows, height - 1, columns),
+        _ if height >= 3 => fit_density(rows, height - 1),
         _ => outcome,
     }
 }
 
-fn fit_density(rows: &[&[Report]], height: u16, columns: usize) -> (Density, Vec<u16>, usize) {
+fn fit_density(rows: &[&[Report]], height: u16) -> (Density, Vec<u16>, usize) {
     let by_density = |density| row_heights(rows, density);
     let (density, mut heights) = if fits(&by_density(Density::Full), height) {
         (Density::Full, by_density(Density::Full))
@@ -941,7 +982,7 @@ fn fit_density(rows: &[&[Report]], height: u16, columns: usize) -> (Density, Vec
             break;
         }
     }
-    let hidden = (rows.len() - keep) * columns;
+    let hidden = rows.iter().skip(keep).map(|row| row.len()).sum();
     heights.truncate(keep);
     (density, heights, hidden)
 }
@@ -1016,7 +1057,9 @@ fn row_line(frame: &mut Frame, report: &Report, area: Rect) {
     match tightest {
         Some(window) => {
             let label_width = 9.min(width / 5);
-            let reserved = name_width + label_width + 1 + 4 + 1;
+            let detailed = width >= DETAILED_PERCENT_MIN;
+            let percentage = percent_text(window.used_percent, detailed);
+            let reserved = name_width + label_width + 1 + percentage.width() + 1;
             let bar_width = width.saturating_sub(reserved).max(4);
             spans.push(Span::styled(
                 pad(&window.label, label_width),
@@ -1025,7 +1068,7 @@ fn row_line(frame: &mut Frame, report: &Report, area: Rect) {
             spans.extend(bar_spans(window.used_percent, bar_width));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                format!("{:>3.0}%", window.used_percent),
+                percentage,
                 Style::default()
                     .fg(ramp(window.used_percent, 0.8))
                     .add_modifier(Modifier::BOLD),
@@ -1118,6 +1161,7 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
     }
 
     let width = inner.width as usize;
+    let detailed_percent = width >= DETAILED_PERCENT_MIN;
     let now = Utc::now();
     let mut shown_reset: Option<DateTime<Utc>> = None;
     for window in &report.windows {
@@ -1141,7 +1185,8 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
         // The bar takes every column the label, percentage, and countdown do not, so its
         // right edge meets the panel edge and the detail text below it, instead of
         // stopping short and leaving the numbers floating in the middle of the panel.
-        let reserved = label_width + 1 + 4 + 1 + reset_width;
+        let percentage = percent_text(window.used_percent, detailed_percent);
+        let reserved = label_width + 1 + percentage.width() + 1 + reset_width;
         let bar_width = width.saturating_sub(reserved).max(6);
 
         let mut row = vec![
@@ -1151,13 +1196,13 @@ fn card(frame: &mut Frame, report: &Report, area: Rect, density: Density) {
         row.extend(bar_spans(window.used_percent, bar_width));
         row.push(Span::raw(" "));
         row.push(Span::styled(
-            format!("{:>3.0}%", window.used_percent),
+            percentage.clone(),
             Style::default()
                 .fg(ramp(window.used_percent, 0.8))
                 .add_modifier(Modifier::BOLD),
         ));
         if compact {
-            let used = label_width + 1 + bar_width + 1 + 4;
+            let used = label_width + 1 + bar_width + 1 + percentage.width();
             let gap = width.saturating_sub(used + reset.width());
             if !reset.is_empty() && gap > 0 {
                 row.push(Span::raw(" ".repeat(gap)));
@@ -1452,6 +1497,37 @@ mod tests {
         assert_eq!(filled, 5);
     }
 
+    #[test]
+    fn wide_layout_keeps_cards_roomy_and_centers_them() {
+        assert_eq!(column_count(101, 4), 1);
+        assert_eq!(column_count(102, 4), 2);
+        assert_eq!(column_count(203, 4), 2);
+        assert_eq!(column_count(204, 4), 3);
+        assert_eq!(column_count(240, 1), 1);
+
+        let area = Rect::new(10, 3, 400, 20);
+        let grid = centered_grid(area, 3);
+        assert_eq!(grid, Rect::new(72, 3, 276, 20));
+        assert_eq!(centered_row(grid, 3, 3), grid);
+        assert_eq!(centered_row(grid, 3, 1), Rect::new(164, 3, 92, 20));
+    }
+
+    #[test]
+    fn roomy_percentages_keep_one_decimal_place() {
+        assert_eq!(percent_text(63.44, false), " 63%");
+        assert_eq!(percent_text(63.44, true), " 63.4%");
+        assert_eq!(percent_text(100.0, true), "100.0%");
+    }
+
+    #[test]
+    fn bar_colour_stays_calm_until_its_endpoint() {
+        assert_eq!(ramp(50.0, 0.0), ramp(50.0, 0.75));
+        assert_ne!(ramp(50.0, 0.75), ramp(50.0, 1.0));
+        assert_ne!(ramp(69.9, 0.0), ramp(70.0, 0.0));
+        assert_ne!(ramp(84.9, 0.0), ramp(85.0, 0.0));
+        assert_ne!(ramp(94.9, 0.0), ramp(95.0, 0.0));
+    }
+
     fn sample_report(provider: ProviderId, windows: usize) -> Report {
         let mut report = Report::new(provider);
         for index in 0..windows {
@@ -1471,19 +1547,19 @@ mod tests {
         let rows: Vec<&[Report]> = reports.chunks(1).collect();
 
         // Roomy: full drawing, three windows at two lines each plus borders.
-        let (density, heights, hidden) = plan(&rows, 40, 1);
+        let (density, heights, hidden) = plan(&rows, 40);
         assert_eq!(density, Density::Full);
         assert_eq!(heights, vec![8, 8, 8]);
         assert_eq!(hidden, 0);
 
         // Tight: one line per window.
-        let (density, heights, hidden) = plan(&rows, 15, 1);
+        let (density, heights, hidden) = plan(&rows, 15);
         assert_eq!(density, Density::Compact);
         assert_eq!(heights, vec![5, 5, 5]);
         assert_eq!(hidden, 0);
 
         // Tighter still: one line per provider.
-        let (density, heights, hidden) = plan(&rows, 6, 1);
+        let (density, heights, hidden) = plan(&rows, 6);
         assert_eq!(density, Density::Row);
         assert_eq!(heights, vec![1, 1, 1]);
         assert_eq!(hidden, 0);
@@ -1499,10 +1575,23 @@ mod tests {
 
         // Three rows of room for four panels: one row goes to the notice, the rest to
         // panels, and nothing disappears without saying so.
-        let (density, heights, hidden) = plan(&rows, 3, 1);
+        let (density, heights, hidden) = plan(&rows, 3);
         assert_eq!(density, Density::Row);
         assert_eq!(heights.len(), 2);
         assert_eq!(hidden, 2);
+    }
+
+    #[test]
+    fn hidden_count_does_not_pad_a_partial_row() {
+        let reports: Vec<Report> = ProviderId::ALL[..4]
+            .iter()
+            .map(|p| sample_report(*p, 3))
+            .collect();
+        let rows: Vec<&[Report]> = reports.chunks(3).collect();
+
+        let (_, heights, hidden) = fit_density(&rows, 1);
+        assert_eq!(heights.len(), 1);
+        assert_eq!(hidden, 1);
     }
 
     /// An open overlay drops the view behind it, and the key guide stays out of the veil.

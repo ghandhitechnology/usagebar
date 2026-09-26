@@ -251,7 +251,8 @@ fn window_line(
         .unwrap_or_default();
     // The bar takes what the label, the percentage and the reset text leave behind.
     let label_width = 16.min(width / 3);
-    let fixed = 2 + label_width + 1 + 4;
+    let percentage = ui::percent_text(window.used_percent, width >= 60);
+    let fixed = 2 + label_width + 1 + percentage.width();
     let reset_width = if reset_text.is_empty() {
         0
     } else {
@@ -267,7 +268,7 @@ fn window_line(
     )];
     spans.extend(ui::bar_spans(window.used_percent, bar_width));
     spans.push(Span::styled(
-        format!(" {:>3.0}%", window.used_percent),
+        format!(" {percentage}"),
         Style::default()
             .fg(ui::ramp(window.used_percent, 0.8))
             .add_modifier(Modifier::BOLD),
