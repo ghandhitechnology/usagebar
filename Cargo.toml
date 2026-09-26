@@ -10,6 +10,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
 # PKCE: a random verifier, and the SHA-256 the S256 challenge is built from.
 getrandom = "0.3"
 sha2 = "0.10"

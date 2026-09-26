@@ -1291,6 +1291,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repeated_failures_keep_the_original_stale_time() {
+        let mut app = test_app();
+        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
+        let mut good = Report::new(ProviderId::Claude).key("claude");
+        good.windows.push(Window::new("Weekly", 42.0));
+        app.absorb(vec![good]);
+
+        app.absorb(vec![
+            Report::failed(ProviderId::Claude, "HTTP 429".into()).key("claude")
+        ]);
+        let first_since = match app.reports[0].health {
+            Health::Stale { since, .. } => since,
+            ref other => panic!("expected stale, got {other:?}"),
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.absorb(vec![Report::failed(
+            ProviderId::Claude,
+            "still offline".into(),
+        )
+        .key("claude")]);
+        let second_since = match app.reports[0].health {
+            Health::Stale { since, .. } => since,
+            ref other => panic!("expected stale, got {other:?}"),
+        };
+
+        assert_eq!(second_since, first_since);
+    }
+
     /// The name the user gave the account titles the panel; the provider's own name
     /// steps aside instead of being printed next to it.
     #[test]

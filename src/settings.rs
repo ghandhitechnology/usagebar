@@ -41,15 +41,26 @@ pub enum Action {
 }
 
 /// What the bottom bar shows while this screen is open.
-pub fn keys() -> Vec<(String, String)> {
-    vec![
-        ("↑↓".into(), "move".into()),
-        ("space".into(), "show/hide".into()),
-        ("shift+↑↓".into(), "reorder".into()),
-        ("r".into(), "rename".into()),
-        ("x".into(), "remove".into()),
-        ("esc".into(), "close".into()),
-    ]
+pub fn keys(app: &App, settings: &Settings) -> Vec<(String, String)> {
+    let pair = |key: &str, action: &str| (key.to_string(), action.to_string());
+    if settings.editing.is_some() || settings.renaming.is_some() {
+        return vec![pair("enter", "save"), pair("esc", "cancel")];
+    }
+    let list = rows(app);
+    let mut keys = match list[settings.selected.min(list.len() - 1)] {
+        Row::Account(_) => vec![
+            pair("space", "show/hide"),
+            pair("r", "rename"),
+            pair("x", "remove"),
+            pair("J/K", "reorder"),
+        ],
+        Row::AddAccount => vec![pair("enter", "connect")],
+        Row::Sort => vec![pair("enter", "change sort")],
+        Row::Interval => vec![pair("enter", "type seconds"), pair("←→", "adjust")],
+    };
+    keys.push(pair("↑↓/tab", "move"));
+    keys.push(pair("esc", "close"));
+    keys
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,7 +332,8 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut cursor: Option<(u16, u16)> = None;
+    // The rename field's column and list row; the row is shifted by the scroll below.
+    let mut cursor: Option<(u16, usize)> = None;
     for (row_index, row) in list.iter().enumerate() {
         let selected = row_index == settings.selected;
         let line = match row {
@@ -341,7 +353,7 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
                         let (shown, column) = rename
                             .input
                             .display((inner.width as usize).saturating_sub(5));
-                        cursor = Some((inner.x + 5 + column as u16, inner.y + row_index as u16));
+                        cursor = Some((inner.x + 5 + column as u16, row_index));
                         (String::new(), shown, TEXT)
                     }
                     None => {
@@ -444,8 +456,9 @@ pub fn draw(frame: &mut Frame, app: &App, settings: &Settings, area: Rect) {
             y.min(inner.y + inner.height - 1),
         ));
     }
-    if let Some((x, y)) = cursor {
-        // The rename field sits where the status does, after the padded account name.
+    if let Some((x, row)) = cursor.filter(|&(_, row)| row >= offset) {
+        // The rename field sits where the title does, on its row as scrolled.
+        let y = inner.y + (row - offset) as u16;
         frame.set_cursor_position((
             x.min(inner.x + inner.width - 1),
             y.min(inner.y + inner.height - 1),
@@ -508,6 +521,76 @@ mod tests {
             )),
         );
         (app, dir)
+    }
+
+    #[test]
+    fn many_accounts_keep_selected_settings_and_errors_visible() {
+        let (mut app, _) = test_app("many");
+        app.accounts = (0..20)
+            .map(|index| {
+                AccountRef::new(format!("account-{index}"), crate::model::ProviderId::Claude)
+            })
+            .collect();
+        let settings = Settings {
+            selected: 20,
+            note: Some("Connection needs attention".into()),
+            ..Settings::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &settings, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("▸    + add account"), "{text}");
+        assert!(text.contains("Connection needs attention"));
+    }
+
+    #[test]
+    fn hints_follow_tab_navigation_and_interval_editing() {
+        let (mut app, _) = test_app("hints");
+        let mut settings = Settings::default();
+        assert_eq!(keys(&app, &settings)[0], ("enter".into(), "connect".into()));
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(keys(&app, &settings)[0].1, "change sort");
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(keys(&app, &settings)[0].1, "type seconds");
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+        );
+        assert_eq!(
+            keys(&app, &settings),
+            vec![
+                ("enter".into(), "save".into()),
+                ("esc".into(), "cancel".into())
+            ]
+        );
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        );
+        handle(
+            &mut settings,
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, crossterm::event::KeyModifiers::SHIFT),
+        );
+        assert_eq!(settings.selected, 1);
     }
 
     fn press(settings: &mut Settings, app: &mut App, code: KeyCode) -> Action {

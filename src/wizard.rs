@@ -189,6 +189,7 @@ impl Wizard {
                 self.note = Some(format!("checked: {summary}"));
             }
             Err(why) => {
+                self.note = None;
                 if let Some(connect) = self.connect.as_mut() {
                     connect.error = Some(why);
                     connect.verified = None;
@@ -418,7 +419,12 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::F(2) => {
             connect.advanced = true;
-            connect.focus = 0;
+            // The advanced form opens on its first typable field, past the sign-in row.
+            connect.focus = connect
+                .fields
+                .iter()
+                .position(|field| field.role != Role::SignIn)
+                .unwrap_or(0);
         }
         KeyCode::Up | KeyCode::BackTab => {
             let fields = connect.visible_fields();
@@ -451,9 +457,8 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
             {
                 return start_signin(wizard);
             }
-            if connect.verified.is_some() || connect.error.is_some() {
-                // A failed check still allows saving: the vendor may be rate limiting
-                // or down, and the panel will keep showing why until it recovers.
+            // A failed check retries on enter; ctrl+s is the explicit unchecked save.
+            if connect.verified.is_some() {
                 return save_connect(wizard, app);
             }
             return check(wizard);
@@ -475,6 +480,7 @@ fn connect(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
                     connect.signed_in = None;
                 }
                 connect.error = None;
+                wizard.note = None;
             }
         }
     }
@@ -917,22 +923,17 @@ impl Connect {
     pub fn new(provider: ProviderId) -> Self {
         let mut fields = Vec::new();
         // A sign-in comes first on the screen, since it is the one way in that does not
-        // need anything on this machine — but the focus starts on the first real field,
-        // so enter still means "read what is already here".
+        // need anything on this machine.
         if providers::oauth_spec(provider).is_some() {
             fields.push(Field::new(Role::SignIn, "Sign in", TextInput::new()));
         }
+        // The usual login location stays prefilled even before the file exists, so
+        // signing in with the vendor's CLI and pressing enter is all it takes.
         if let Some(path) = credentials::vendor_file(provider) {
-            // Prefilled when the file is there; a path that is not stays an empty field.
-            let path = if path.exists() {
-                path.display().to_string()
-            } else {
-                String::new()
-            };
             fields.push(Field::new(
                 Role::Config,
-                "Local config",
-                TextInput::with_value(path),
+                "Login file",
+                TextInput::with_value(path.display().to_string()),
             ));
         }
         match provider {
@@ -961,29 +962,48 @@ impl Connect {
             ProviderId::OpenCodeGo => {
                 fields.push(Field::new(
                     Role::Token,
-                    "API key",
+                    "Go API key",
                     TextInput::new().secret(),
                 ));
             }
             _ => {
-                fields.push(Field::new(Role::Token, "Token", TextInput::new().secret()));
+                let label = match provider {
+                    ProviderId::Cursor => "Access token",
+                    ProviderId::Grok => "Session key",
+                    _ => "API key",
+                };
+                fields.push(Field::new(Role::Token, label, TextInput::new().secret()));
             }
         }
-        fields.push(Field::new(Role::Name, "Name", TextInput::new()));
-        // The focus opens on the first field that holds something a user can type into.
-        let focus = fields
-            .iter()
-            .position(|field| field.role != Role::SignIn)
-            .unwrap_or(0);
-        Self {
+        fields.push(Field::new(Role::Name, "Name (optional)", TextInput::new()));
+        let mut connect = Self {
             provider,
             fields,
-            focus,
+            focus: 0,
+            advanced: provider == ProviderId::OpenCodeGo,
             verified: None,
             error: None,
             signin: None,
             signed_in: None,
-        }
+        };
+        // The focus opens on the first visible field that can be typed into.
+        connect.focus = connect
+            .visible_fields()
+            .into_iter()
+            .find(|&index| connect.fields[index].role != Role::SignIn)
+            .unwrap_or(0);
+        connect
+    }
+
+    /// The rows the form shows. Raw credentials wait behind F2, so the plain form is the
+    /// browser sign-in (where there is one) and the name; OpenCode Go has no login file,
+    /// so its key is always shown.
+    fn visible_fields(&self) -> Vec<usize> {
+        (0..self.fields.len())
+            .filter(|&index| {
+                self.advanced || matches!(self.fields[index].role, Role::SignIn | Role::Name)
+            })
+            .collect()
     }
 
     /// What a field holds, trimmed. Roles rather than positions, so dropping a field for
@@ -1045,10 +1065,19 @@ impl Connect {
             return Ok((credential, Some(path)));
         }
         Err(match provider {
-            ProviderId::Claude => "give a credentials file, or both tokens".into(),
-            ProviderId::Codex => "give an auth.json path, or an access token".into(),
-            ProviderId::OpenCodeGo => "paste a Go API key".into(),
-            _ => "give a credentials file, or paste a token".into(),
+            ProviderId::Claude => {
+                "Claude login not found. Sign in with Claude Code, then retry.".into()
+            }
+            ProviderId::Codex => "Codex login not found. Sign in with Codex, then retry.".into(),
+            ProviderId::OpenCodeGo => "Paste your OpenCode Go API key.".into(),
+            ProviderId::Cursor => {
+                "Cursor login not found. Sign in with Cursor agent, then retry.".into()
+            }
+            ProviderId::Grok => "Grok login not found. Sign in with Grok CLI, then retry.".into(),
+            ProviderId::Devin => "Devin login not found. Sign in to Devin, then retry.".into(),
+            ProviderId::CommandCode => {
+                "Command Code login not found. Sign in to Command Code, then retry.".into()
+            }
         })
     }
 }
@@ -1070,8 +1099,8 @@ pub fn draw(frame: &mut Frame, app: &App, wizard: &Wizard, area: Rect) {
             .connect
             .as_ref()
             .map(|connect| {
-                connect.fields.len()
-                    + 8
+                connect.visible_fields().len()
+                    + 10
                     + usize::from(
                         connect
                             .signin
@@ -1230,7 +1259,7 @@ pub fn keys(wizard: &Wizard) -> Vec<(String, String)> {
                 }
                 return keys;
             }
-            let mut keys = vec![pair("↑↓", "field"), pair("ctrl+r", "reveal")];
+            let mut keys = Vec::new();
             if connect.is_some_and(|connect| {
                 connect
                     .fields
@@ -1393,12 +1422,12 @@ fn provider_lines(wizard: &Wizard, inner: Rect, lines: &mut Vec<Line>) {
 fn login_instructions(provider: ProviderId) -> (&'static str, &'static str) {
     match provider {
         ProviderId::Claude => (
-            "Use your Claude Code login",
-            "Sign in to Claude Code, then press enter. usagebar uses its saved login.",
+            "Sign in with a browser, or use your Claude Code login",
+            "Sign in with a browser, or sign in to Claude Code and press enter.",
         ),
         ProviderId::Codex => (
-            "Use your Codex login",
-            "Sign in to Codex, then press enter. usagebar uses its saved login.",
+            "Sign in with a browser, or use your Codex login",
+            "Sign in with a browser, or sign in to Codex and press enter.",
         ),
         ProviderId::OpenCodeGo => (
             "Use your OpenCode Go key",
@@ -1445,7 +1474,7 @@ fn connect_lines(
             "Manual connection · existing Go keys are detected during setup."
         } else if connect.advanced {
             "Advanced: pasted credentials override the login file."
-        } else if connect.fields[0].input.is_blank() {
+        } else if connect.value(Role::Config).is_empty() {
             "Sign in with the provider, or press F2 for advanced token entry."
         } else {
             "The usual login location is ready below. F2 opens advanced token entry."
@@ -1456,7 +1485,8 @@ fn connect_lines(
     let field_width = inner.width.saturating_sub(20).max(10) as usize;
     // A sign-in puts the code it needs under the form, where the form's own fields end.
     let signing_in = connect.signin.as_ref().filter(|signin| !signin.waiting);
-    for (index, field) in connect.fields.iter().enumerate() {
+    for index in connect.visible_fields() {
+        let field = &connect.fields[index];
         let focused = index == connect.focus && connect.signin.is_none();
         // The sign-in row is an action, not a field: it reads like the rows that add
         // things rather than the ones that hold something.
@@ -1693,19 +1723,24 @@ mod tests {
         let mut wizard = Wizard::new_add(SortMode::Manual);
         wizard.step = Step::Connect;
         wizard.connect = Some(Connect::new(ProviderId::Claude));
-        assert_eq!(wizard.connect.as_ref().unwrap().visible_fields(), vec![3]);
+        // The plain form is the browser sign-in row and the name.
+        assert_eq!(
+            wizard.connect.as_ref().unwrap().visible_fields(),
+            vec![0, 4]
+        );
+        assert_eq!(wizard.connect.as_ref().unwrap().focus, 4);
         handle(
             &mut wizard,
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
         );
-        assert_eq!(wizard.connect.as_ref().unwrap().focus, 3);
+        assert_eq!(wizard.connect.as_ref().unwrap().focus, 4);
         handle(
             &mut wizard,
             &mut app,
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
         );
-        assert_eq!(wizard.connect.as_ref().unwrap().focus, 3);
+        assert_eq!(wizard.connect.as_ref().unwrap().focus, 0);
         handle(
             &mut wizard,
             &mut app,
@@ -1713,9 +1748,11 @@ mod tests {
         );
         assert_eq!(
             wizard.connect.as_ref().unwrap().visible_fields(),
-            vec![0, 1, 2, 3]
+            vec![0, 1, 2, 3, 4]
         );
-        assert_eq!(wizard.connect.as_ref().unwrap().focus, 0);
+        // Advanced opens on the login file, past the sign-in row.
+        let connect = wizard.connect.as_ref().unwrap();
+        assert_eq!(connect.fields[connect.focus].role, Role::Config);
     }
 
     #[test]
@@ -1743,7 +1780,7 @@ mod tests {
     #[test]
     fn go_manual_setup_offers_a_key_instead_of_an_unsupported_file_import() {
         let form = Connect::new(ProviderId::OpenCodeGo);
-        assert_eq!(form.visible_fields(), vec![1, 2]);
+        assert_eq!(form.visible_fields(), vec![0, 1]);
         assert_eq!(form.fields[form.focus].label, "Go API key");
     }
 
@@ -1851,10 +1888,10 @@ mod tests {
             .iter()
             .any(|field| field.role == Role::Config));
         assert_eq!(connect.fields[0].role, Role::Token);
-        assert_eq!(connect.fields[0].label, "API key");
+        assert_eq!(connect.fields[0].label, "Go API key");
         assert_eq!(
             connect.build(ProviderId::OpenCodeGo).unwrap_err(),
-            "paste a Go API key"
+            "Paste your OpenCode Go API key."
         );
 
         set(&mut connect, Role::Token, "  sk-go-somewhere-else  ");
@@ -2058,7 +2095,7 @@ mod tests {
             .collect();
         assert!(text.contains("Connect OpenCode Go"), "{text}");
         assert!(text.contains("API key"), "{text}");
-        assert!(!text.contains("Local config"), "{text}");
+        assert!(!text.contains("Login file"), "{text}");
         // And the connect form is what the bottom bar is describing.
         assert!(keys(&wizard).contains(&("enter".to_string(), "check".to_string())));
         std::fs::remove_dir_all(&dir).ok();
@@ -2085,7 +2122,7 @@ mod tests {
 
         press(&mut wizard, &mut app, KeyCode::Down);
         let connect = wizard.connect.as_ref().unwrap();
-        assert_eq!(connect.fields[connect.focus].role, Role::Config);
+        assert_eq!(connect.fields[connect.focus].role, Role::Name);
         let guide = keys(&wizard);
         assert!(guide.contains(&("enter".to_string(), "check".to_string())));
         assert!(!guide.iter().any(|(key, _)| key == "o"));

@@ -299,6 +299,7 @@ fn run_tui(
 
     let (tx, rx) = mpsc::channel::<RefreshEvent>();
     let (scan_tx, scan_rx) = mpsc::channel::<Vec<providers::Detected>>();
+    let mut refresh = RefreshGate::default();
     // The token history is read off the local logs, which are big enough that it is
     // spoiling its own thread. Daily columns do not need to be fresher than this.
     let (usage_tx, usage_rx) = mpsc::channel::<usage::Usage>();

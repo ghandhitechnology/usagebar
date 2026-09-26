@@ -26,10 +26,10 @@ file never holds one.
 
 ## Setup
 
-The first run scans the machine and opens with what it found. `space` toggles a credential,
-`a` connects a provider by hand, enter goes to the finish screen — except on a row the scan
-could not make a credential out of, where enter opens that provider's connect screen so one
-can be typed in.
+The first run scans the machine and opens with what it found. `space` includes or excludes
+one, `a` connects another provider, and enter goes to the finish screen, except on a row the
+scan could not make a credential out of, where enter opens that provider's connect screen so
+one can be typed in.
 
 For providers with a local CLI, setup starts with that provider's normal saved login path.
 Sign in with the provider's own CLI, then press enter to check the account. Raw token entry
