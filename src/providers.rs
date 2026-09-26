@@ -473,8 +473,19 @@ fn codex(credential: &Credential, origin: Option<&Path>, live_only: bool) -> Res
             // The newest local rollout is a fallback, not a source: it needs a Codex
             // home directory, which only exists when the credential came from a file.
             let fallback = origin.and_then(Path::parent).map(codex_rollout).transpose();
-            match fallback {
-                Ok(Some(report)) => Ok(report),
+            match (fallback, &live) {
+                // Name the live failure, so a revoked login reads as one instead of
+                // hiding behind the cached number.
+                (Ok(Some(mut report)), Err(why)) => {
+                    if let Health::Stale { since, .. } = report.health {
+                        report.health = Health::Stale {
+                            why: format!("{why}; showing the cached local reading"),
+                            since,
+                        };
+                    }
+                    Ok(report)
+                }
+                (Ok(Some(report)), _) => Ok(report),
                 _ => live,
             }
         }
@@ -491,7 +502,7 @@ fn codex_live(access_token: &str, account_id: Option<&str>) -> Result<Report> {
     let (status, body) = get_json("https://chatgpt.com/backend-api/wham/usage", &borrowed)?;
     if status == 401 || status == 403 {
         return Err(
-            "token rejected by chatgpt.com; run codex once, usagebar will pick it up".into(),
+            "token rejected by chatgpt.com; run `codex login`, usagebar will pick it up".into(),
         );
     }
     require_success(status)?;
