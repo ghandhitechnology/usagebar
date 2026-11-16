@@ -12,6 +12,7 @@ mod ui;
 mod usage;
 mod wizard;
 
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -31,6 +32,9 @@ use ui::{App, Overlay, OverlayAction};
 use wizard::Wizard;
 
 const DEFAULT_INTERVAL: u64 = config::DEFAULT_INTERVAL;
+/// How often a list that only a scan made is scanned again, so a login made or removed
+/// while this runs shows up without a restart.
+const RESCAN: Duration = Duration::from_secs(300);
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -297,9 +301,8 @@ fn run_tui(
     app.file_store = Arc::clone(&file_store);
     app.boot_note = config_error;
 
-    let (tx, rx) = mpsc::channel::<RefreshEvent>();
+    let (tx, rx) = mpsc::channel::<Landed>();
     let (scan_tx, scan_rx) = mpsc::channel::<Vec<providers::Detected>>();
-    let mut refresh = RefreshGate::default();
     // The token history is read off the local logs, which are big enough that it is
     // spoiling its own thread. Daily columns do not need to be fresher than this.
     let (usage_tx, usage_rx) = mpsc::channel::<usage::Usage>();
@@ -309,57 +312,62 @@ fn run_tui(
         }
         std::thread::sleep(Duration::from_secs(300));
     });
-    let scanning = if app.accounts.is_empty() {
-        std::thread::spawn(move || {
-            let _ = scan_tx.send(providers::detect());
-        });
-        true
+    // A saved list is read as it is. Anything else, the first run included, is what
+    // the machine holds, so it starts with a scan.
+    let mut scan_running = false;
+    let mut last_scan = Instant::now();
+    if app.config.auto_detect() {
+        app.scanning = true;
+        scan_running = spawn_scan(&scan_tx);
     } else {
-        request_refresh(&mut refresh, &tx, &mut app);
-        false
-    };
+        fetch(&mut app, &tx, Scope::All);
+    }
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let tick = Duration::from_millis(120);
     let mut last_trigger = Instant::now();
     let result = loop {
-        if scanning {
-            if let Ok(detected) = scan_rx.try_recv() {
-                let (accounts, detected_store) = providers::accounts_from_detected(&detected);
-                let detected_store = Arc::new(detected_store);
-                app.accounts = accounts;
-                app.store = Arc::clone(&detected_store) as Arc<dyn CredentialStore>;
-                app.detected_store = Some(detected_store);
-                // Nothing saved yet means this is the first run; offer setup.
-                if !app.persisted && app.overlay.is_none() {
-                    app.overlay = Some(Overlay::Wizard(Box::new(Wizard::new(
-                        detected,
-                        app.config.sort,
-                    ))));
-                }
-                request_refresh(&mut refresh, &tx, &mut app);
-                last_trigger = Instant::now();
+        while let Ok(detected) = scan_rx.try_recv() {
+            scan_running = false;
+            let first = std::mem::take(&mut app.scanning);
+            // Once the list is the user's, a scan has nothing to say about it.
+            if !app.config.auto_detect() {
+                continue;
             }
-        }
-        if let Ok(update) = rx.try_recv() {
-            match update {
-                RefreshEvent::Progress(reports) => absorb_progress(&mut app, reports),
-                RefreshEvent::Complete(reports) => {
-                    app.absorb(reports);
-                    if refresh.completed() {
-                        spawn_refresh(&tx, &mut app);
-                    }
-                }
+            let (accounts, detected_store) = providers::accounts_from_detected(&detected);
+            let detected_store = Arc::new(detected_store);
+            app.set_accounts(
+                accounts,
+                Arc::clone(&detected_store) as Arc<dyn CredentialStore>,
+            );
+            app.detected_store = Some(detected_store);
+            // Nothing saved yet means this is the first run; offer setup.
+            if first && !app.persisted && app.overlay.is_none() {
+                app.overlay = Some(Overlay::Wizard(Box::new(Wizard::new(
+                    detected,
+                    app.config.sort,
+                ))));
             }
+            fetch(&mut app, &tx, Scope::Missing);
         }
-        if let Ok(usage) = usage_rx.try_recv() {
+        // Everything that landed since the last frame, so a burst of readings shows in
+        // one frame rather than one per tick.
+        while let Ok(landed) = rx.try_recv() {
+            app.land(landed.epoch, landed.report);
+        }
+        while let Ok(usage) = usage_rx.try_recv() {
             app.usage = Some(usage);
         }
-        let due = !app.paused && last_trigger.elapsed() >= Duration::from_secs(app.interval_secs);
-        if due && !app.accounts.is_empty() {
-            request_refresh(&mut refresh, &tx, &mut app);
-            last_trigger = Instant::now();
+        if !app.paused {
+            if last_trigger.elapsed() >= Duration::from_secs(app.interval_secs) {
+                fetch(&mut app, &tx, Scope::All);
+                last_trigger = Instant::now();
+            }
+            if app.config.auto_detect() && !scan_running && last_scan.elapsed() >= RESCAN {
+                scan_running = spawn_scan(&scan_tx);
+                last_scan = Instant::now();
+            }
         }
 
         if let Some(overlay) = app.overlay.as_mut() {
@@ -402,15 +410,13 @@ fn run_tui(
                                 }
                                 app.boot_note = None;
                             }
+                            // The panels already follow the new list; only an account
+                            // with nothing on screen yet needs the network.
                             OverlayAction::Refresh => {
                                 app.overlay = Some(overlay);
-                                request_refresh(&mut refresh, &tx, &mut app);
-                                last_trigger = Instant::now();
+                                fetch(&mut app, &tx, Scope::Missing);
                             }
-                            OverlayAction::Saved => {
-                                request_refresh(&mut refresh, &tx, &mut app);
-                                last_trigger = Instant::now();
-                            }
+                            OverlayAction::Saved => fetch(&mut app, &tx, Scope::Missing),
                             OverlayAction::OpenWizard => {
                                 app.overlay = Some(Overlay::Wizard(Box::new(Wizard::new_add(
                                     app.config.sort,
@@ -421,8 +427,12 @@ fn run_tui(
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                             KeyCode::Char('r') => {
-                                request_refresh(&mut refresh, &tx, &mut app);
+                                fetch(&mut app, &tx, Scope::All);
                                 last_trigger = Instant::now();
+                                if app.config.auto_detect() && !scan_running {
+                                    scan_running = spawn_scan(&scan_tx);
+                                    last_scan = Instant::now();
+                                }
                             }
                             KeyCode::Char(' ') => app.paused = !app.paused,
                             KeyCode::Char('s') => {
@@ -451,102 +461,134 @@ fn run_tui(
     result
 }
 
-#[derive(Default)]
-struct RefreshGate {
-    in_flight: bool,
-    pending: bool,
-}
-
-impl RefreshGate {
-    /// Start immediately when idle; otherwise remember one follow-up refresh.
-    fn request(&mut self) -> bool {
-        if self.in_flight {
-            self.pending = true;
-            false
-        } else {
-            self.in_flight = true;
-            true
-        }
-    }
-
-    /// Finish the active batch and immediately claim a queued refresh, if any.
-    fn completed(&mut self) -> bool {
-        self.in_flight = false;
-        if self.pending {
-            self.pending = false;
-            self.in_flight = true;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn request_refresh(gate: &mut RefreshGate, tx: &mpsc::Sender<RefreshEvent>, app: &mut App) {
-    if !app.accounts.is_empty() && gate.request() {
-        spawn_refresh(tx, app);
-    }
-}
-
-fn spawn_refresh(tx: &mpsc::Sender<RefreshEvent>, app: &mut App) {
+/// Scan the machine on its own thread; the OpenCode check is a network call per key.
+fn spawn_scan(tx: &mpsc::Sender<Vec<providers::Detected>>) -> bool {
     let tx = tx.clone();
-    let accounts = app.accounts.clone();
-    let store = Arc::clone(&app.store);
-    let sort = app.config.sort;
-    app.refreshing = true;
     std::thread::spawn(move || {
-        let reports = providers::fetch_all_progressive(&accounts, &store, sort, |reports| {
-            let _ = tx.send(RefreshEvent::Progress(reports.to_vec()));
-        });
-        let _ = tx.send(RefreshEvent::Complete(reports));
+        let _ = tx.send(providers::detect());
     });
+    true
 }
 
-enum RefreshEvent {
-    Progress(Vec<Report>),
-    Complete(Vec<Report>),
+/// One account's reading, tagged with the epoch its fetch started under.
+struct Landed {
+    epoch: u64,
+    report: Report,
 }
 
-/// Show successful accounts as soon as they finish. Failures wait for the complete
-/// batch so App::absorb can preserve the previous good reading as stale.
-fn absorb_progress(app: &mut App, reports: Vec<Report>) {
-    let expected: Vec<&str> = app
-        .accounts
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// The poll: every visible account.
+    All,
+    /// Only accounts with nothing on screen, after the list changed.
+    Missing,
+}
+
+/// The visible accounts a fetch should read now. An account already being read under
+/// its current login is skipped, so a slow vendor never runs twice at once and never
+/// spends one refresh token in two places; the others do not wait for it.
+fn due(app: &App, scope: Scope) -> Vec<(AccountRef, u64)> {
+    app.accounts
         .iter()
         .filter(|account| !account.hidden)
-        .map(|account| account.id.as_str())
-        .collect();
-    app.reports
-        .retain(|report| expected.contains(&report.key.as_str()));
-    for report in reports.into_iter().filter(|report| {
-        !matches!(report.health, Health::Unavailable(_) | Health::Stale { .. })
-            && expected.contains(&report.key.as_str())
-    }) {
-        match app
-            .reports
-            .iter()
-            .position(|current| current.key == report.key)
-        {
-            Some(index) => app.reports[index] = report,
-            None => app.reports.push(report),
-        }
+        .filter(|account| scope == Scope::All || app.report_for(&account.id).is_none())
+        .map(|account| (account.clone(), app.epoch(&account.id)))
+        .filter(|(account, epoch)| !app.inflight.contains(&(account.id.clone(), *epoch)))
+        .collect()
+}
+
+fn fetch(app: &mut App, tx: &mpsc::Sender<Landed>, scope: Scope) {
+    let batch = due(app, scope);
+    if batch.is_empty() {
+        return;
     }
-    providers::sort_reports(&mut app.reports, &app.accounts, app.config.sort);
+    app.inflight.extend(
+        batch
+            .iter()
+            .map(|(account, epoch)| (account.id.clone(), *epoch)),
+    );
+    let store = Arc::clone(&app.store);
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let epochs: HashMap<String, u64> = batch
+            .iter()
+            .map(|(account, epoch)| (account.id.clone(), *epoch))
+            .collect();
+        let accounts: Vec<AccountRef> = batch.into_iter().map(|(account, _)| account).collect();
+        providers::fetch_each(&accounts, &store, |report| {
+            let _ = tx.send(Landed {
+                epoch: epochs.get(&report.key).copied().unwrap_or_default(),
+                report: report.clone(),
+            });
+        });
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RefreshGate;
+    use super::*;
+    use crate::model::ProviderId;
 
+    fn app() -> App {
+        let dir = std::env::temp_dir().join(format!("usagebar-main-{}", std::process::id()));
+        App::new(
+            60,
+            Arc::new(MemoryStore::new()),
+            SortMode::Manual,
+            Arc::new(FileStore::load(dir.join("credentials.json"))),
+        )
+    }
+
+    /// An account still being read is not read again, and a poll does not wait on it
+    /// to read the rest.
     #[test]
-    fn refresh_gate_coalesces_overlapping_requests() {
-        let mut gate = RefreshGate::default();
+    fn an_account_in_flight_is_skipped_but_does_not_hold_up_the_rest() {
+        let mut app = app();
+        app.accounts = vec![
+            AccountRef::new("claude", ProviderId::Claude),
+            AccountRef::new("codex", ProviderId::Codex),
+        ];
+        app.inflight.insert(("claude".into(), 0));
+        let ids: Vec<String> = due(&app, Scope::All)
+            .into_iter()
+            .map(|(account, _)| account.id)
+            .collect();
+        assert_eq!(ids, vec!["codex"]);
+    }
 
-        assert!(gate.request());
-        assert!(!gate.request());
-        assert!(!gate.request());
-        assert!(gate.completed());
-        assert!(!gate.completed());
-        assert!(gate.request());
+    /// Removing an account and connecting another under the same id must not let the
+    /// old login's reading, still in flight, land on the new one.
+    #[test]
+    fn a_reading_for_a_replaced_login_is_dropped() {
+        let mut app = app();
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+        let login = |token: &str| {
+            credentials::StoredCredential::new(credentials::Credential::Token {
+                token: token.into(),
+            })
+        };
+        store.put("cursor", login("old")).unwrap();
+        app.set_accounts(
+            vec![AccountRef::new("cursor", ProviderId::Cursor)],
+            Arc::clone(&store),
+        );
+        let started = app.epoch("cursor");
+        app.inflight.insert(("cursor".into(), started));
+
+        let before = app.logins();
+        store.put("cursor", login("new")).unwrap();
+        app.set_accounts_from(
+            &before,
+            vec![AccountRef::new("cursor", ProviderId::Cursor)],
+            store,
+        );
+
+        let mut stale = Report::new(ProviderId::Cursor).key("cursor");
+        stale.windows.push(model::Window::new("Total", 90.0));
+        app.land(started, stale);
+        assert!(app.reports.is_empty(), "the old login's reading was shown");
+        assert!(app.inflight.is_empty());
+        // The new login has nothing on screen, so it is what gets read next.
+        assert_eq!(due(&app, Scope::Missing).len(), 1);
     }
 }

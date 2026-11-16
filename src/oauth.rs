@@ -96,6 +96,14 @@ impl SignIn {
     }
 }
 
+/// However the sign-in ends, the listener lets go of the port, so the next attempt can
+/// bind it instead of finding it taken for five minutes.
+impl Drop for SignIn {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Wait for one callback on `listener`, then answer the browser. The code travels back
 /// over the channel the sign-in holds.
 fn serve(listener: TcpListener, state: &str, cancel: &AtomicBool) -> Result<String, String> {

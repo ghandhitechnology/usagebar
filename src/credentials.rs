@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,36 @@ pub trait CredentialStore: Send + Sync {
     fn get(&self, account_id: &str) -> Option<StoredCredential>;
     fn put(&self, account_id: &str, credential: StoredCredential) -> Result<(), String>;
     fn remove(&self, account_id: &str) -> Result<(), String>;
+    /// Write `next` only while the account still holds `expected`, and say whether it
+    /// did. A fetch that started before the account was removed or reconnected must not
+    /// bring the old secret back.
+    fn replace(
+        &self,
+        account_id: &str,
+        expected: &StoredCredential,
+        next: StoredCredential,
+    ) -> Result<bool, String>;
+}
+
+/// Two credentials are the same login when they read the same vendor file, or, with no
+/// file behind them, carry the same secret. A token the vendor rotated is still the same
+/// login; a different key, or a slot that was empty, is not.
+pub fn same_login(a: Option<&StoredCredential>, b: Option<&StoredCredential>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => match (&a.origin, &b.origin) {
+            (Some(x), Some(y)) => x == y,
+            (None, None) => a.secret == b.secret,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A fetch thread that panicked while holding the lock leaves the data intact, since
+/// every write replaces the map entry whole; the next caller should not crash over it.
+fn lock(doc: &Mutex<StoreDoc>) -> MutexGuard<'_, StoreDoc> {
+    doc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -138,28 +168,41 @@ impl FileStore {
 
 impl CredentialStore for FileStore {
     fn get(&self, account_id: &str) -> Option<StoredCredential> {
-        self.doc
-            .lock()
-            .unwrap()
-            .credentials
-            .get(account_id)
-            .cloned()
+        lock(&self.doc).credentials.get(account_id).cloned()
     }
 
     fn put(&self, account_id: &str, credential: StoredCredential) -> Result<(), String> {
         // The lock is held across the write: two accounts rotating in one poll must not
         // land on disk out of order, and the in-memory copy is what the next write reads.
-        let mut doc = self.doc.lock().unwrap();
+        let mut doc = lock(&self.doc);
         doc.credentials.insert(account_id.to_string(), credential);
         let body = Self::flush_locked(&doc)?;
         fsutil::write_atomic(&self.path, body.as_bytes(), Some(0o600))
     }
 
     fn remove(&self, account_id: &str) -> Result<(), String> {
-        let mut doc = self.doc.lock().unwrap();
-        doc.credentials.remove(account_id);
+        let mut doc = lock(&self.doc);
+        if doc.credentials.remove(account_id).is_none() {
+            return Ok(());
+        }
         let body = Self::flush_locked(&doc)?;
         fsutil::write_atomic(&self.path, body.as_bytes(), Some(0o600))
+    }
+
+    fn replace(
+        &self,
+        account_id: &str,
+        expected: &StoredCredential,
+        next: StoredCredential,
+    ) -> Result<bool, String> {
+        let mut doc = lock(&self.doc);
+        if doc.credentials.get(account_id) != Some(expected) {
+            return Ok(false);
+        }
+        doc.credentials.insert(account_id.to_string(), next);
+        let body = Self::flush_locked(&doc)?;
+        fsutil::write_atomic(&self.path, body.as_bytes(), Some(0o600))?;
+        Ok(true)
     }
 }
 
@@ -178,26 +221,33 @@ impl MemoryStore {
 
 impl CredentialStore for MemoryStore {
     fn get(&self, account_id: &str) -> Option<StoredCredential> {
-        self.doc
-            .lock()
-            .unwrap()
-            .credentials
-            .get(account_id)
-            .cloned()
+        lock(&self.doc).credentials.get(account_id).cloned()
     }
 
     fn put(&self, account_id: &str, credential: StoredCredential) -> Result<(), String> {
-        self.doc
-            .lock()
-            .unwrap()
+        lock(&self.doc)
             .credentials
             .insert(account_id.to_string(), credential);
         Ok(())
     }
 
     fn remove(&self, account_id: &str) -> Result<(), String> {
-        self.doc.lock().unwrap().credentials.remove(account_id);
+        lock(&self.doc).credentials.remove(account_id);
         Ok(())
+    }
+
+    fn replace(
+        &self,
+        account_id: &str,
+        expected: &StoredCredential,
+        next: StoredCredential,
+    ) -> Result<bool, String> {
+        let mut doc = lock(&self.doc);
+        if doc.credentials.get(account_id) != Some(expected) {
+            return Ok(false);
+        }
+        doc.credentials.insert(account_id.to_string(), next);
+        Ok(true)
     }
 }
 
@@ -325,9 +375,15 @@ pub fn current(
         if origin_may_win(&origin, &stored) {
             if let Some(secret) = from_vendor_file(account.provider, &origin) {
                 if secret != stored.secret {
-                    stored.secret = secret;
-                    stored.updated_at = Utc::now();
-                    store.put(&account.id, stored.clone())?;
+                    let adopted = StoredCredential {
+                        secret,
+                        origin: stored.origin.clone(),
+                        updated_at: Utc::now(),
+                    };
+                    // Only over the copy this read started from: if the account was
+                    // removed or reconnected meanwhile, this fetch is already moot.
+                    store.replace(&account.id, &stored, adopted.clone())?;
+                    stored = adopted;
                 }
             }
         }
@@ -348,7 +404,10 @@ pub fn record(
         origin: previous.origin.clone(),
         updated_at: Utc::now(),
     };
-    store.put(&account.id, next.clone())?;
+    // A removed or reconnected account keeps whatever it holds now. The vendor file is
+    // still updated below: its refresh token was just spent, and Claude Code needs the
+    // pair that replaced it.
+    store.replace(&account.id, previous, next.clone())?;
     if let (Some(origin), Credential::ClaudeOauth { refresh_token, .. }) =
         (previous.origin.as_ref(), &previous.secret)
     {
@@ -583,6 +642,31 @@ mod tests {
                 "account-{n} was dropped by a concurrent write"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rotation that finishes after its account was removed or reconnected must not
+    /// write the old login back over what the store holds now.
+    #[test]
+    fn a_late_rotation_never_brings_an_old_login_back() {
+        let dir = std::env::temp_dir().join(format!("usagebar-creds8-{}", std::process::id()));
+        let store = FileStore::load(dir.join("credentials.json"));
+        let account = AccountRef::new("cursor", ProviderId::Cursor);
+        let token = |token: &str| Credential::Token {
+            token: token.into(),
+        };
+        let started = StoredCredential::new(token("old"));
+        store.put("cursor", started.clone()).unwrap();
+
+        store.remove("cursor").unwrap();
+        record(&account, &store, &started, token("rotated")).unwrap();
+        assert!(store.get("cursor").is_none(), "a removed account came back");
+
+        store
+            .put("cursor", StoredCredential::new(token("reconnected")))
+            .unwrap();
+        record(&account, &store, &started, token("rotated")).unwrap();
+        assert_eq!(store.get("cursor").unwrap().secret, token("reconnected"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

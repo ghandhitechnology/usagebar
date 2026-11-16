@@ -1,6 +1,6 @@
 //! Rendering. A dense panel grid with vendor-accurate numbers, tuned for a dark terminal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::{self, Config, SortMode};
-use crate::credentials::{CredentialStore, FileStore, MemoryStore};
+use crate::credentials::{self, CredentialStore, FileStore, MemoryStore, StoredCredential};
 use crate::model::{AccountRef, Health, ProviderId, Report};
 use crate::settings::{self, Settings};
 use crate::wizard::{self, Wizard};
@@ -24,7 +24,10 @@ use crate::wizard::{self, Wizard};
 pub struct App {
     pub reports: Vec<Report>,
     pub last_refresh: Option<Instant>,
-    pub refreshing: bool,
+    /// Fetches running now, by account and the epoch they started under.
+    pub inflight: HashSet<(String, u64)>,
+    /// True until the first scan of this machine lands.
+    pub scanning: bool,
     pub paused: bool,
     pub interval_secs: u64,
     /// True when --interval named a value for this run only; finishing setup must not
@@ -47,6 +50,10 @@ pub struct App {
     /// Token history read from the local CLIs' logs; `None` until the first scan lands.
     pub usage: Option<crate::usage::Usage>,
     pub overlay: Option<Overlay>,
+    /// Moves on whenever the login behind an account id changes, so a reading fetched
+    /// for the old login is never shown under the new one. Absent means zero.
+    epochs: HashMap<String, u64>,
+    last_epoch: u64,
 }
 
 /// The modal screens. One at a time; the base view owns every key when this is None.
@@ -121,7 +128,8 @@ impl App {
         Self {
             reports: Vec::new(),
             last_refresh: None,
-            refreshing: false,
+            inflight: HashSet::new(),
+            scanning: false,
             paused: false,
             interval_secs,
             interval_locked: false,
@@ -139,6 +147,8 @@ impl App {
             boot_note: None,
             usage: None,
             overlay: None,
+            epochs: HashMap::new(),
+            last_epoch: 0,
         }
     }
 
@@ -153,29 +163,46 @@ impl App {
         }
     }
 
-    /// The user changed which accounts are shown or their order. Accounts that only
-    /// existed as a scan result are committed to the credential store here, because an
-    /// account the user kept has to survive a restart.
+    /// The user changed which accounts are shown, their names or their order. Nothing
+    /// here needs the network: the panels follow the list at once, and only an account
+    /// with no reading yet is fetched.
     pub fn save_accounts(&mut self, accounts: Vec<AccountRef>) -> Option<String> {
-        self.accounts = accounts;
-        self.config.accounts = self.accounts.clone();
+        let before = self.logins();
+        if let Err(why) = self.commit_detected(&accounts) {
+            return Some(why);
+        }
+        self.config.accounts = accounts.clone();
         // Once the list is the user's, stop scanning for new credentials each run.
         self.config.detect = Some(false);
-        for account in &self.accounts {
-            if self.file_store.get(&account.id).is_none() {
-                if let Some(stored) = self
-                    .detected_store
-                    .as_ref()
-                    .and_then(|store| store.get(&account.id))
-                {
-                    if let Err(why) = self.file_store.put(&account.id, stored) {
-                        return Some(why);
-                    }
-                }
+        let store = Arc::clone(&self.file_store) as Arc<dyn CredentialStore>;
+        self.set_accounts_from(&before, accounts, store);
+        self.save_config()
+    }
+
+    /// Copy the scan's secret into the store for every account that is still only a
+    /// scan result, because an account the user kept has to survive a restart. An
+    /// account the saved list already has is left alone: its secret may have been typed
+    /// in, and a scan never outranks that.
+    pub fn commit_detected(&self, accounts: &[AccountRef]) -> Result<(), String> {
+        let Some(detected) = &self.detected_store else {
+            return Ok(());
+        };
+        let committed = !self.config.auto_detect();
+        for account in accounts {
+            if committed
+                && self
+                    .config
+                    .accounts
+                    .iter()
+                    .any(|kept| kept.id == account.id)
+            {
+                continue;
+            }
+            if let Some(stored) = detected.get(&account.id) {
+                self.file_store.put(&account.id, stored)?;
             }
         }
-        self.store = Arc::clone(&self.file_store) as Arc<dyn CredentialStore>;
-        self.save_config()
+        Ok(())
     }
 
     pub fn forget_credentials(&self, account_id: &str) {
@@ -184,55 +211,125 @@ impl App {
         }
     }
 
-    pub fn absorb(&mut self, reports: Vec<Report>) {
-        let previous: HashMap<String, Report> = self
-            .reports
+    /// Each account's login as the store holds it now, to compare with after a change.
+    pub fn logins(&self) -> HashMap<String, StoredCredential> {
+        self.accounts
             .iter()
-            .map(|report| (report.key.clone(), report.clone()))
-            .collect();
-        let last_good = self.last_refresh.unwrap_or_else(Instant::now);
-        // A fetch started before the account list changed can still be in flight; its
-        // readings are for accounts the user just hid or removed.
-        let expected: Vec<&str> = self
-            .accounts
-            .iter()
-            .filter(|account| !account.hidden)
-            .map(|account| account.id.as_str())
-            .collect();
-
-        let reports: Vec<Report> = reports
-            .into_iter()
-            .filter(|report| expected.contains(&report.key.as_str()))
-            .map(|mut report| {
-                // A rate limit or a network blip should not erase a panel that had a real
-                // vendor number a moment ago; keep the number and say how old it is.
-                if report.windows.is_empty() {
-                    if let Health::Unavailable(why) = &report.health {
-                        if let Some(last) =
-                            previous.get(&report.key).filter(|r| !r.windows.is_empty())
-                        {
-                            let since = match &last.health {
-                                Health::Stale { since, .. } => *since,
-                                _ => last_good,
-                            };
-                            report.windows = last.windows.clone();
-                            report.facts = last.facts.clone();
-                            report.notes = last.notes.clone();
-                            report.plan = report.plan.or_else(|| last.plan.clone());
-                            report.health = Health::Stale {
-                                why: why.clone(),
-                                since,
-                            };
-                        }
-                    }
-                }
-                report
+            .filter_map(|account| {
+                self.store
+                    .get(&account.id)
+                    .map(|stored| (account.id.clone(), stored))
             })
-            .collect();
+            .collect()
+    }
 
-        self.reports = reports;
+    pub fn epoch(&self, account_id: &str) -> u64 {
+        self.epochs.get(account_id).copied().unwrap_or(0)
+    }
+
+    /// Switch to a new account list and the store its secrets come from.
+    pub fn set_accounts(&mut self, accounts: Vec<AccountRef>, store: Arc<dyn CredentialStore>) {
+        let before = self.logins();
+        self.set_accounts_from(&before, accounts, store);
+    }
+
+    /// The same, against logins taken before the store was written to. A reading stays
+    /// only while its account is still shown and still reads the same login; keeping it
+    /// past that would put one login's numbers under another's name.
+    pub fn set_accounts_from(
+        &mut self,
+        before: &HashMap<String, StoredCredential>,
+        accounts: Vec<AccountRef>,
+        store: Arc<dyn CredentialStore>,
+    ) {
+        let mut epochs = HashMap::new();
+        for account in &accounts {
+            let unchanged = self
+                .accounts
+                .iter()
+                .any(|old| old.id == account.id && old.problem == account.problem)
+                && credentials::same_login(
+                    before.get(&account.id),
+                    store.get(&account.id).as_ref(),
+                );
+            let epoch = if unchanged {
+                self.epoch(&account.id)
+            } else {
+                self.last_epoch += 1;
+                self.last_epoch
+            };
+            epochs.insert(account.id.clone(), epoch);
+        }
+        let current = &self.epochs;
+        self.reports.retain(|report| {
+            epochs.get(&report.key).copied() == Some(current.get(&report.key).copied().unwrap_or(0))
+        });
+        self.epochs = epochs;
+        self.accounts = accounts;
+        self.store = store;
+        self.reconcile();
+    }
+
+    /// Keep the panels in step with the account list: nothing for an account that is
+    /// gone or hidden, the account's current name on the rest, in the current order.
+    pub fn reconcile(&mut self) {
+        let accounts = &self.accounts;
+        self.reports.retain(|report| {
+            accounts
+                .iter()
+                .any(|account| account.id == report.key && !account.hidden)
+        });
+        for report in &mut self.reports {
+            if let Some(account) = accounts.iter().find(|account| account.id == report.key) {
+                report.label = account.label.clone();
+            }
+        }
+        crate::providers::sort_reports(&mut self.reports, accounts, self.config.sort);
+    }
+
+    /// A reading from a fetch thread. It counts only when the account still reads the
+    /// login the fetch started with.
+    pub fn land(&mut self, epoch: u64, report: Report) {
+        self.inflight.remove(&(report.key.clone(), epoch));
+        if self.epoch(&report.key) == epoch {
+            self.absorb(vec![report]);
+        }
+    }
+
+    /// Merge readings into the panels. Accounts these do not cover keep what they had.
+    pub fn absorb(&mut self, reports: Vec<Report>) {
+        for mut report in reports {
+            let index = self
+                .reports
+                .iter()
+                .position(|current| current.key == report.key);
+            // A rate limit or a network blip should not erase a panel that had a real
+            // vendor number a moment ago; keep the number and say how old it is.
+            if let (Some(index), Health::Unavailable(why)) = (index, &report.health) {
+                let last = &self.reports[index];
+                if report.windows.is_empty() && !last.windows.is_empty() {
+                    let since = match &last.health {
+                        Health::Stale { since, .. } => *since,
+                        _ => last.at,
+                    };
+                    report.health = Health::Stale {
+                        why: why.clone(),
+                        since,
+                    };
+                    report.windows = last.windows.clone();
+                    report.facts = last.facts.clone();
+                    report.notes = last.notes.clone();
+                    report.plan = report.plan.or_else(|| last.plan.clone());
+                    report.account = report.account.or_else(|| last.account.clone());
+                }
+            }
+            match index {
+                Some(index) => self.reports[index] = report,
+                None => self.reports.push(report),
+            }
+        }
         self.last_refresh = Some(Instant::now());
-        self.refreshing = false;
+        self.reconcile();
     }
 
     /// The report for an account id, in display order.
@@ -440,7 +537,7 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
 
     let status = if app.paused {
         Span::styled("paused", Style::default().fg(ACCENT))
-    } else if app.refreshing {
+    } else if !app.inflight.is_empty() {
         Span::styled("refreshing…", Style::default().fg(ACCENT))
     } else {
         Span::styled(format!("updated {elapsed} ago"), Style::default().fg(DIM))
@@ -596,11 +693,17 @@ fn key_guide(entries: &[(String, String)], width: usize) -> Vec<Span<'static>> {
 /// Cards flow left to right, wrapping into rows; a row is as tall as its tallest card.
 fn grid(frame: &mut Frame, app: &App, area: Rect) {
     if app.reports.is_empty() {
+        let note = if app.scanning {
+            "looking for logins on this machine…"
+        } else if app.accounts.is_empty() {
+            "no accounts · s to connect one"
+        } else if app.accounts.iter().all(|account| account.hidden) {
+            "every account is hidden · s to show one"
+        } else {
+            "collecting first sample…"
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "collecting first sample…",
-                Style::default().fg(DIM),
-            ))),
+            Paragraph::new(Line::from(Span::styled(note, Style::default().fg(DIM)))),
             area,
         );
         return;
@@ -1371,10 +1474,11 @@ mod tests {
     #[test]
     fn a_named_account_titles_its_panel() {
         let mut app = test_app();
-        app.accounts = vec![AccountRef::new("claude", ProviderId::Claude)];
-        let mut report = Report::new(ProviderId::Claude)
-            .key("claude")
-            .label(Some("Chatgpt".into()));
+        app.accounts = vec![AccountRef {
+            label: Some("Chatgpt".into()),
+            ..AccountRef::new("claude", ProviderId::Claude)
+        }];
+        let mut report = Report::new(ProviderId::Claude).key("claude");
         report.windows.push(Window::new("Weekly", 42.0));
         app.absorb(vec![report]);
 
