@@ -219,6 +219,8 @@ pub struct Report {
     pub notes: Vec<String>,
     pub source: Source,
     pub health: Health,
+    /// When this reading was taken, so a later failure can say how old it is.
+    pub at: std::time::Instant,
 }
 
 impl Report {
@@ -234,6 +236,7 @@ impl Report {
             notes: Vec::new(),
             source: Source::Api,
             health: Health::Ok,
+            at: std::time::Instant::now(),
         }
     }
 

@@ -173,9 +173,8 @@ pub fn draw(frame: &mut Frame, app: &App, detail: &Detail, area: Rect) {
             ]));
         }
     }
-    let refreshed = app
-        .last_refresh
-        .map(|at| format!("{}s ago", at.elapsed().as_secs()))
+    let refreshed = report
+        .map(|report| format!("{}s ago", report.at.elapsed().as_secs()))
         .unwrap_or_else(|| "never".into());
     lines.push(Line::from(vec![
         Span::styled("  refreshed    ", Style::default().fg(DIM)),

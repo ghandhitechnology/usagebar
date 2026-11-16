@@ -65,8 +65,11 @@ signed out from under the user.
 Nothing is written until the finish screen. Esc skips setup and records that choice as
 `"detect": true` with an empty account list, which means "keep scanning each run"; removing
 every account later writes `"detect": false`, so an empty list is a choice, not a reset.
+While scanning, the scan repeats every five minutes and on `r`, so a login made or removed
+while usagebar runs shows up without a restart.
 
-`s` opens the same screens later to add another account.
+`s` opens the same screens later to add another account. Adding one while the list is
+still only a scan result keeps the scanned accounts alongside it.
 
 ## Keys
 

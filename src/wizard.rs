@@ -237,6 +237,11 @@ impl Wizard {
     }
 
     pub fn paste(&mut self, text: &str) {
+        // The check in flight is for what the form held when it started; a paste now
+        // would be saved as checked without ever having been.
+        if self.verifying {
+            return;
+        }
         if let Some(connect) = self.connect.as_mut() {
             // While a sign-in is open, the pasted text is the code from the browser.
             if let Some(signin) = connect.signin.as_mut() {
@@ -676,12 +681,11 @@ fn save_connect(wizard: &mut Wizard, app: &mut App) -> Action {
     };
 
     let existing = find_existing(wizard, app, provider, &credential, origin.as_deref());
-    // Ids are allocated against the config and the connections made so far in this same
-    // session, or two accounts of one provider would collide and replace each other.
+    // Ids are allocated against the config, the scanned accounts that finishing will
+    // keep, and the connections made so far in this same session, or two accounts of one
+    // provider would collide and replace each other.
     let id = existing.unwrap_or_else(|| {
-        let taken: Vec<&str> = app
-            .config
-            .accounts
+        let taken: Vec<&str> = kept_accounts(wizard, app)
             .iter()
             .map(|account| account.id.as_str())
             .chain(
@@ -749,6 +753,14 @@ fn done(wizard: &mut Wizard, app: &mut App, key: KeyEvent) -> Action {
 
 /// Write the config and the credentials the wizard collected.
 pub fn finish(wizard: &mut Wizard, app: &mut App) -> Result<(), String> {
+    // Taken before anything is written, so a reconnected account can be told apart from
+    // one that kept its login.
+    let before = app.logins();
+    if keeps_scan(wizard, app) {
+        let shown = app.accounts.clone();
+        app.commit_detected(&shown)?;
+        app.config.accounts = shown;
+    }
     let already = already_imported(app);
     // Two Go keys with no vendor names need ordinals, the same as a fresh scan gives them.
     let mut go_count = app
@@ -841,15 +853,34 @@ pub fn finish(wizard: &mut Wizard, app: &mut App) -> Result<(), String> {
     // Finishing with a list means the list is the source of truth; finishing with
     // nothing selected is the same as skipping, so keep scanning each run.
     app.config.detect = Some(app.config.accounts.is_empty());
-    app.accounts = app.config.accounts.clone();
-    app.store = std::sync::Arc::clone(&app.file_store)
-        as std::sync::Arc<dyn crate::credentials::CredentialStore>;
+    // An empty list keeps the scan's accounts on screen, the way skipping does.
+    if !app.config.accounts.is_empty() {
+        let accounts = app.config.accounts.clone();
+        let store = std::sync::Arc::clone(&app.file_store)
+            as std::sync::Arc<dyn crate::credentials::CredentialStore>;
+        app.set_accounts_from(&before, accounts, store);
+    }
     if let Some(why) = app.save_config() {
         return Err(why);
     }
     app.persisted = true;
     app.boot_note = None;
     Ok(())
+}
+
+/// Adding to a list that only a scan ever made: finishing keeps the scanned accounts on
+/// screen, or connecting one provider would make every other one disappear.
+fn keeps_scan(wizard: &Wizard, app: &App) -> bool {
+    !wizard.first_run && app.config.auto_detect()
+}
+
+/// The accounts that will still be there once this wizard finishes.
+fn kept_accounts<'a>(wizard: &Wizard, app: &'a App) -> &'a [AccountRef] {
+    if keeps_scan(wizard, app) {
+        &app.accounts
+    } else {
+        &app.config.accounts
+    }
 }
 
 struct Imported {
@@ -892,13 +923,18 @@ fn find_existing(
         };
         (same_secret || same_origin).then(|| id.to_string())
     };
-    for account in app
-        .config
-        .accounts
+    // A scanned account's secret is still only in the running store.
+    let scanned = keeps_scan(wizard, app);
+    for account in kept_accounts(wizard, app)
         .iter()
         .filter(|account| account.provider == provider)
     {
-        if let Some(id) = matches(&app.file_store.get(&account.id), &account.id) {
+        let stored = if scanned {
+            app.store.get(&account.id)
+        } else {
+            app.file_store.get(&account.id)
+        };
+        if let Some(id) = matches(&stored, &account.id) {
             return Some(id);
         }
     }
@@ -2067,6 +2103,50 @@ mod tests {
             vec!["claude", "codex"]
         );
         assert!(app.file_store.get("codex").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Connecting one more account while the list is still only a scan result keeps the
+    /// scanned accounts, credentials and all, instead of replacing them with the new one.
+    #[test]
+    fn adding_to_a_scanned_list_keeps_what_the_scan_found() {
+        use std::sync::Arc;
+        let dir = scratch("add-to-scan");
+        let mut app = app_with(&dir);
+        let (accounts, detected) = providers::accounts_from_detected(&[Detected {
+            provider: ProviderId::Grok,
+            credential: Some(Credential::Token {
+                token: "scanned".into(),
+            }),
+            origin: None,
+            error: None,
+        }]);
+        let detected = Arc::new(detected);
+        app.set_accounts(accounts, Arc::clone(&detected) as Arc<dyn CredentialStore>);
+        app.detected_store = Some(detected);
+        app.config.detect = Some(true);
+
+        // A second Grok login, connected by hand, is an account of its own.
+        let mut wizard = Wizard::new_add(SortMode::Manual);
+        let mut connect = Connect::new(ProviderId::Grok);
+        connect.advanced = true;
+        set(&mut connect, Role::Config, "");
+        set(&mut connect, Role::Token, "typed");
+        connect.verified = Some("checked".into());
+        wizard.connect = Some(connect);
+        wizard.step = Step::Connect;
+        save_connect(&mut wizard, &mut app);
+        finish(&mut wizard, &mut app).unwrap();
+
+        let ids: Vec<&str> = app.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["grok", "grok-2"]);
+        let token = |id: &str| match app.file_store.get(id).map(|stored| stored.secret) {
+            Some(Credential::Token { token }) => token,
+            other => panic!("{id}: {other:?}"),
+        };
+        assert_eq!(token("grok"), "scanned");
+        assert_eq!(token("grok-2"), "typed");
+        assert!(!app.config.auto_detect());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -119,7 +119,8 @@ fn require_success(status: u16) -> Result<()> {
 fn f(v: &Value, key: &str) -> Option<f64> {
     match v.get(key)? {
         Value::Number(n) => n.as_f64(),
-        Value::String(raw) => raw.trim().parse::<f64>().ok(),
+        // "NaN" and "inf" parse, and would draw as a bar of nothing.
+        Value::String(raw) => raw.trim().parse::<f64>().ok().filter(|n| n.is_finite()),
         _ => None,
     }
 }
@@ -1473,16 +1474,17 @@ pub fn fetch_all(
     store: &Arc<dyn CredentialStore>,
     sort: SortMode,
 ) -> Vec<Report> {
-    fetch_all_progressive(accounts, store, sort, |_| {})
+    let mut reports = fetch_each(accounts, store, |_| {});
+    sort_reports(&mut reports, accounts, sort);
+    reports
 }
 
-/// Fetch concurrently and publish sorted snapshots as each account finishes. The
-/// final return value is the complete batch used by non-interactive commands.
-pub fn fetch_all_progressive(
+/// Fetch the visible accounts concurrently and hand over each report the moment its
+/// account finishes, so a slow vendor never holds back a fast one. Returns them all.
+pub fn fetch_each(
     accounts: &[AccountRef],
     store: &Arc<dyn CredentialStore>,
-    sort: SortMode,
-    mut progress: impl FnMut(&[Report]),
+    mut each: impl FnMut(&Report),
 ) -> Vec<Report> {
     let visible: Vec<AccountRef> = accounts
         .iter()
@@ -1499,7 +1501,11 @@ pub fn fetch_all_progressive(
             let store = Arc::clone(store);
             let tx = tx.clone();
             std::thread::spawn(move || loop {
-                let Some(account) = queue.lock().unwrap().pop_front() else {
+                let next = queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pop_front();
+                let Some(account) = next else {
                     break;
                 };
                 let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1520,9 +1526,8 @@ pub fn fetch_all_progressive(
 
     let mut reports = Vec::with_capacity(visible.len());
     for report in rx {
+        each(&report);
         reports.push(report);
-        sort_reports(&mut reports, accounts, sort);
-        progress(&reports);
     }
     for handle in handles {
         let _ = handle.join();
@@ -1552,17 +1557,19 @@ pub fn verify(
 }
 
 /// Manual keeps the account list order; smart is worst first, then most used, then the
-/// list order again so the panels that move are the ones that have to.
+/// list order again so the panels that move are the ones that have to. Reports arrive in
+/// whatever order their vendors answered, so manual has to sort too.
 pub fn sort_reports(reports: &mut [Report], accounts: &[AccountRef], mode: SortMode) {
-    if mode == SortMode::Manual {
-        return;
-    }
     let position = |report: &Report| {
         accounts
             .iter()
             .position(|account| account.id == report.key)
             .unwrap_or(usize::MAX)
     };
+    if mode == SortMode::Manual {
+        reports.sort_by_key(position);
+        return;
+    }
     reports.sort_by(|a, b| {
         let rank = |r: &Report| match r.health {
             Health::Ok => 0,
@@ -1698,19 +1705,18 @@ mod tests {
     }
 
     #[test]
-    fn progressive_fetch_publishes_each_finished_account() {
+    fn each_finished_account_is_handed_over_on_its_own() {
         let accounts = vec![
             AccountRef::new("claude", ProviderId::Claude).problem("offline"),
             AccountRef::new("codex", ProviderId::Codex).problem("offline"),
         ];
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
-        let mut counts = Vec::new();
+        let mut seen = Vec::new();
 
-        let reports = fetch_all_progressive(&accounts, &store, SortMode::Manual, |reports| {
-            counts.push(reports.len());
-        });
+        let reports = fetch_each(&accounts, &store, |report| seen.push(report.key.clone()));
 
-        assert_eq!(counts, vec![1, 2]);
+        seen.sort();
+        assert_eq!(seen, vec!["claude", "codex"]);
         assert_eq!(reports.len(), 2);
     }
 
@@ -1952,11 +1958,16 @@ mod tests {
             vec!["codex", "claude", "cursor"]
         );
 
+        // Manual is the account list, whatever order the vendors answered in.
         let mut manual = vec![
+            Report::new(ProviderId::Cursor).key("cursor"),
             Report::new(ProviderId::Codex).key("codex"),
             Report::new(ProviderId::Claude).key("claude"),
         ];
         sort_reports(&mut manual, &accounts, SortMode::Manual);
-        assert_eq!(manual[0].key, "codex");
+        assert_eq!(
+            manual.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            vec!["claude", "codex", "cursor"]
+        );
     }
 }

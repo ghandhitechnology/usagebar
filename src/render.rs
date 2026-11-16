@@ -103,11 +103,11 @@ mod tests {
                 std::env::temp_dir().join("usagebar-render-unicode-missing/credentials.json"),
             )),
         );
-        app.accounts
-            .push(AccountRef::new("codex", ProviderId::Codex));
-        app.absorb(vec![Report::new(ProviderId::Codex)
-            .key("codex")
-            .label(Some("한글👩‍💻".into()))]);
+        app.accounts.push(AccountRef {
+            label: Some("한글👩‍💻".into()),
+            ..AccountRef::new("codex", ProviderId::Codex)
+        });
+        app.absorb(vec![Report::new(ProviderId::Codex).key("codex")]);
         let ansi = to_ansi(80, 20, &app).unwrap();
         let mut plain = String::new();
         let mut in_escape = false;
